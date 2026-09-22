@@ -74,5 +74,3 @@ The guard is a port of the original Claude Code push blast-radius hook written b
 ## License
 
 [MIT](LICENSE)
-
-[MIT](LICENSE)
