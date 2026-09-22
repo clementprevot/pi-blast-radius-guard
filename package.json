@@ -1,6 +1,6 @@
 {
 	"name": "@clementprevot/pi-blast-radius-guard",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Pi extension that intercepts git push commands that look like accidents (protected branch targets, oversized diffs) and asks the user first",
 	"keywords": [
 		"pi-package",
