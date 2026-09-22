@@ -67,6 +67,12 @@ To try the extension in a live session without installing it:
 pi -e /path/to/this/repo
 ```
 
+## Credits
+
+The guard is a port of the original Claude Code push blast-radius hook written by Stephen R. ([srosenthal-dd](https://github.com/srosenthal-dd)), built after one mis-merge too many pinging every code owner of a monorepo.
+
 ## License
+
+[MIT](LICENSE)
 
 [MIT](LICENSE)
