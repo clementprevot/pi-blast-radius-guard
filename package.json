@@ -1,0 +1,46 @@
+{
+	"name": "@clementprevot/pi-blast-radius-guard",
+	"version": "0.1.0",
+	"description": "Pi extension that intercepts git push commands that look like accidents (protected branch targets, oversized diffs) and asks the user first",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"git",
+		"guard",
+		"push",
+		"safety"
+	],
+	"license": "MIT",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/clementprevot/pi-blast-radius-guard.git"
+	},
+	"packageManager": "yarn@4.9.2",
+	"engines": {
+		"node": ">=22.6"
+	},
+	"files": [
+		"index.ts"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.0"
+	},
+	"scripts": {
+		"test": "node --test test/*.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}
