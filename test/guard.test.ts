@@ -85,6 +85,7 @@ import {
 	evaluateTarget,
 	isIntegrationBranch,
 	rootBaseRef,
+	stackPushWithoutAtomic,
 	type DiffStats,
 	type GuardDeps,
 } from "../index.ts";
@@ -173,7 +174,7 @@ test("rootBaseRef terminates on a PR-base cycle", async () => {
 	});
 
 	const result = await rootBaseRef(deps, "a", CONFIG, "master");
-	assert.ok(result.compareRef);
+	assert.ok(result.root);
 });
 
 test("a wrong base merged into the branch still blocks at the right base", async () => {
@@ -248,4 +249,89 @@ test("a draft PR with draftAction warn only warns", async () => {
 	const decision = decide([await evaluateTarget(deps, config, "feature", "master")], config);
 	assert.equal(decision.action, "warn");
 	assert.match(decision.draftNote ?? "", /draft/);
+});
+
+test("pushing the stack tip alone flags the stale base GitHub will show", async () => {
+	const deps = fakeDeps({
+		prs: {
+			ui: { baseRefName: "core", state: "OPEN" },
+			core: { baseRefName: "preprod", state: "OPEN" },
+		},
+		refs: ["origin/core", "origin/preprod", "ui"],
+		stats: {
+			"origin/preprod...ui": { files: 23, commits: 4 },
+			"origin/core...ui": { files: 340, commits: 30 },
+		},
+	});
+
+	const evaluation = await evaluateTarget(deps, CONFIG, "ui", "master", new Set(["ui"]));
+	assert.equal(evaluation.stats?.files, 23);
+	assert.equal(evaluation.visibleRef, "origin/core");
+	assert.equal(evaluation.visibleStats?.files, 340);
+
+	const decision = decide([evaluation], CONFIG);
+	assert.equal(decision.action, "confirm");
+	assert.match(decision.summary, /340 files/);
+	assert.match(decision.summary, /stale base/);
+});
+
+test("pushing the whole stack projects the post-push base and allows", async () => {
+	const deps = fakeDeps({
+		prs: {
+			ui: { baseRefName: "core", state: "OPEN" },
+			core: { baseRefName: "preprod", state: "OPEN" },
+		},
+		refs: ["origin/preprod", "core", "ui"],
+		stats: {
+			"origin/preprod...ui": { files: 23, commits: 4 },
+			"core...ui": { files: 12, commits: 2 },
+		},
+	});
+
+	const evaluation = await evaluateTarget(
+		deps,
+		CONFIG,
+		"ui",
+		"master",
+		new Set(["core", "ui"]),
+	);
+	assert.equal(evaluation.visibleRef, "core");
+	assert.equal(evaluation.visibleStats?.files, 12);
+	assert.equal(decide([evaluation], CONFIG).action, "allow");
+});
+
+test("a PR base missing from origin and not pushed flags the push", async () => {
+	const deps = fakeDeps({
+		prs: { ui: { baseRefName: "core", state: "OPEN" } },
+		refs: ["origin/preprod", "ui"],
+		stats: { "origin/preprod...ui": { files: 23, commits: 4 } },
+	});
+
+	const evaluation = await evaluateTarget(deps, CONFIG, "ui", "master");
+	assert.equal(evaluation.baseMissing, true);
+
+	const decision = decide([evaluation], CONFIG);
+	assert.equal(decision.action, "confirm");
+	assert.match(decision.summary, /not available locally/);
+});
+
+test("stackPushWithoutAtomic flags only stack pushes without --atomic", () => {
+	const prBases = new Map([
+		["core", "preprod"],
+		["ui", "core"],
+		["unrelated-a", "master"],
+		["unrelated-b", "master"],
+	]);
+
+	const stack = [{ targets: ["core", "ui"], atomic: false }];
+	assert.deepEqual(stackPushWithoutAtomic(stack, prBases), { targets: ["core", "ui"], base: "core", tip: "ui" });
+
+	const atomic = [{ targets: ["core", "ui"], atomic: true }];
+	assert.equal(stackPushWithoutAtomic(atomic, prBases), undefined);
+
+	const unrelated = [{ targets: ["unrelated-a", "unrelated-b"], atomic: false }];
+	assert.equal(stackPushWithoutAtomic(unrelated, prBases), undefined);
+
+	const single = [{ targets: ["ui"], atomic: false }];
+	assert.equal(stackPushWithoutAtomic(single, prBases), undefined);
 });
