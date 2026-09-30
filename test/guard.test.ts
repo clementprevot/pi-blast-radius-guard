@@ -79,3 +79,173 @@ test("matchesProtected honors default branch protection", () => {
 	const off: Config = { ...config, protectDefaultBranch: false };
 	assert.equal(matchesProtected("develop", off, "develop"), false);
 });
+
+import {
+	decide,
+	evaluateTarget,
+	isIntegrationBranch,
+	rootBaseRef,
+	type DiffStats,
+	type GuardDeps,
+} from "../index.ts";
+
+interface FakePr {
+	baseRefName: string;
+	isDraft?: boolean;
+	state: string;
+}
+
+function fakeDeps(options: {
+	prs?: Record<string, FakePr>;
+	refs?: string[];
+	stats?: Record<string, DiffStats>;
+	ghCalls?: string[][];
+}): GuardDeps {
+	const { prs = {}, refs = [], stats = {}, ghCalls = [] } = options;
+	return {
+		gh: async (args) => {
+			ghCalls.push(args);
+			if (args[0] === "pr" && args[1] === "view") {
+				const pr = prs[args[2]];
+				if (!pr) throw new Error(`no pr for ${args[2]}`);
+				return JSON.stringify(pr);
+			}
+			throw new Error(`unexpected gh args: ${args.join(" ")}`);
+		},
+		verifyRef: async (name) => refs.includes(name),
+		diffStats: async (baseRef, headRef) => stats[`${baseRef}...${headRef}`],
+	};
+}
+
+const CONFIG: Config = { ...DEFAULT_CONFIG };
+
+test("isIntegrationBranch covers protected, default, and staging branches", () => {
+	assert.equal(isIntegrationBranch("preprod", CONFIG, "master"), true);
+	assert.equal(isIntegrationBranch("master", CONFIG, "master"), true);
+	assert.equal(isIntegrationBranch("gh-scope-core", CONFIG, "master"), false);
+});
+
+test("evaluateTarget uses the pushed branch's PR, not the checked-out branch's", async () => {
+	const ghCalls: string[][] = [];
+	const deps = fakeDeps({
+		prs: { "gh-scope-core": { baseRefName: "preprod", state: "OPEN" } },
+		refs: ["origin/preprod", "gh-scope-core"],
+		stats: { "origin/preprod...gh-scope-core": { files: 23, commits: 5 } },
+		ghCalls,
+	});
+
+	// Worktree checked out on gh-scope-ui while pushing gh-scope-core.
+	const targets = pushTargets(["origin", "gh-scope-core"], "gh-scope-ui");
+	assert.deepEqual(targets, ["gh-scope-core"]);
+
+	const evaluation = await evaluateTarget(deps, CONFIG, targets[0], "master");
+	assert.equal(evaluation.compareRef, "origin/preprod");
+	assert.deepEqual(evaluation.stats, { files: 23, commits: 5 });
+	assert.ok(
+		ghCalls.some((args) => args.join(" ") === "pr view gh-scope-core --json baseRefName,isDraft,state"),
+		"gh pr view must be called with the pushed branch",
+	);
+	assert.ok(!ghCalls.some((args) => args.includes("gh-scope-ui")));
+});
+
+test("evaluateTarget walks a two-PR stack to the integration branch", async () => {
+	const deps = fakeDeps({
+		prs: {
+			"stack-1": { baseRefName: "stack-0", state: "OPEN" },
+			"stack-0": { baseRefName: "preprod", state: "OPEN" },
+		},
+		// origin/stack-0 exists but is stale; only the preprod ref is a valid root.
+		refs: ["origin/stack-0", "origin/preprod", "stack-1"],
+		stats: { "origin/preprod...stack-1": { files: 12, commits: 3 } },
+	});
+
+	const evaluation = await evaluateTarget(deps, CONFIG, "stack-1", "master");
+	assert.equal(evaluation.compareRef, "origin/preprod");
+	assert.deepEqual(evaluation.stats, { files: 12, commits: 3 });
+});
+
+test("rootBaseRef terminates on a PR-base cycle", async () => {
+	const deps = fakeDeps({
+		prs: {
+			a: { baseRefName: "b", state: "OPEN" },
+			b: { baseRefName: "a", state: "OPEN" },
+		},
+	});
+
+	const result = await rootBaseRef(deps, "a", CONFIG, "master");
+	assert.ok(result.compareRef);
+});
+
+test("a wrong base merged into the branch still blocks at the right base", async () => {
+	const deps = fakeDeps({
+		prs: { feature: { baseRefName: "preprod", state: "OPEN" } },
+		refs: ["origin/preprod", "feature"],
+		stats: { "origin/preprod...feature": { files: 7763, commits: 1726 } },
+	});
+
+	const decision = decide([await evaluateTarget(deps, CONFIG, "feature", "master")], CONFIG);
+	assert.equal(decision.action, "confirm");
+	assert.match(decision.summary, /7763 files/);
+	assert.match(decision.summary, /origin\/preprod/);
+});
+
+test("a multi-ref push blocks only the oversized ref", async () => {
+	const deps = fakeDeps({
+		prs: {
+			big: { baseRefName: "preprod", state: "OPEN" },
+			small: { baseRefName: "preprod", state: "OPEN" },
+		},
+		refs: ["origin/preprod", "big", "small"],
+		stats: {
+			"origin/preprod...big": { files: 600, commits: 40 },
+			"origin/preprod...small": { files: 3, commits: 1 },
+		},
+	});
+
+	const evaluations = [
+		await evaluateTarget(deps, CONFIG, "big", "master"),
+		await evaluateTarget(deps, CONFIG, "small", "master"),
+	];
+	const decision = decide(evaluations, CONFIG);
+	assert.equal(decision.action, "confirm");
+	assert.match(decision.summary, /\bbig\b/);
+	assert.ok(!decision.summary.includes("small"));
+});
+
+test("a push with no open PR falls back to the default branch and only warns", async () => {
+	const deps = fakeDeps({
+		refs: ["origin/master", "feature"],
+		stats: { "origin/master...feature": { files: 60, commits: 2 } },
+	});
+
+	const evaluation = await evaluateTarget(deps, CONFIG, "feature", "master");
+	assert.equal(evaluation.compareRef, "origin/master");
+	assert.equal(evaluation.stats?.files, 60);
+	const decision = decide([evaluation], CONFIG);
+	assert.equal(decision.action, "warn");
+});
+
+test("a protected target without a PR still escalates to confirm", async () => {
+	const deps = fakeDeps({
+		refs: ["origin/master", "prod"],
+		stats: { "origin/master...prod": { files: 1, commits: 1 } },
+	});
+
+	const evaluation = await evaluateTarget(deps, CONFIG, "prod", "master");
+	const decision = decide([evaluation], CONFIG);
+	assert.equal(decision.action, "confirm");
+	assert.match(decision.summary, /targets a protected branch/);
+});
+
+test("a draft PR with draftAction warn only warns", async () => {
+	const deps = fakeDeps({
+		prs: { feature: { baseRefName: "preprod", state: "OPEN", isDraft: true } },
+		refs: ["origin/preprod", "feature"],
+		stats: { "origin/preprod...feature": { files: 600, commits: 40 } },
+	});
+
+	const config: Config = { ...CONFIG, draftAction: "warn" };
+	const decision = decide([await evaluateTarget(deps, config, "feature", "master")], config);
+	assert.equal(decision.action, "warn");
+	assert.match(decision.draftNote ?? "", /draft/);
+});

@@ -24,6 +24,7 @@ export interface Config {
 	protectedBranches: string[];
 	protectDefaultBranch: boolean;
 	draftAction: "warn" | "block";
+	integrationBranches: string[];
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -31,6 +32,7 @@ export const DEFAULT_CONFIG: Config = {
 	protectedBranches: ["main", "master", "prod"],
 	protectDefaultBranch: true,
 	draftAction: "block",
+	integrationBranches: ["preprod", "develop", "staging"],
 };
 
 function readConfigFile(path: string): Partial<Config> | undefined {
@@ -64,13 +66,23 @@ export function parseRegex(pattern: string): RegExp | undefined {
 	}
 }
 
-export function matchesProtected(branch: string, config: Config, defaultBranch?: string): boolean {
-	const candidates = [...config.protectedBranches];
-	if (config.protectDefaultBranch && defaultBranch) candidates.push(defaultBranch);
+function nameMatches(branch: string, candidates: string[]): boolean {
 	return candidates.some((candidate) => {
 		const regex = parseRegex(candidate);
 		return regex ? regex.test(branch) : candidate.toLowerCase() === branch.toLowerCase();
 	});
+}
+
+export function matchesProtected(branch: string, config: Config, defaultBranch?: string): boolean {
+	const candidates = [...config.protectedBranches];
+	if (config.protectDefaultBranch && defaultBranch) candidates.push(defaultBranch);
+	return nameMatches(branch, candidates);
+}
+
+// Integration branches are the roots a PR stack should ultimately target:
+// protected branches, the default branch, and well-known staging branches.
+export function isIntegrationBranch(branch: string, config: Config, defaultBranch?: string): boolean {
+	return matchesProtected(branch, config, defaultBranch) || nameMatches(branch, config.integrationBranches);
 }
 
 export function subcommands(command: string): string[] {
@@ -154,19 +166,26 @@ function currentBranch(): Promise<string | undefined> {
 		.catch(() => undefined);
 }
 
+// Injected shell access, so evaluation logic stays testable without git or gh.
+export interface GuardDeps {
+	gh(args: string[]): Promise<string>;
+	verifyRef(name: string): Promise<boolean>;
+	diffStats(baseRef: string, headRef: string): Promise<DiffStats | undefined>;
+}
+
+export interface DiffStats {
+	files: number;
+	commits: number;
+}
+
 interface PrInfo {
 	base: string;
 	isDraft: boolean;
 }
 
-async function openPr(): Promise<PrInfo | undefined> {
+export async function prForBranch(gh: GuardDeps["gh"], branch: string): Promise<PrInfo | undefined> {
 	try {
-		const { stdout } = await run("gh", [
-			"pr",
-			"view",
-			"--json",
-			"baseRefName,isDraft,state",
-		]);
+		const stdout = await gh(["pr", "view", branch, "--json", "baseRefName,isDraft,state"]);
 		const pr = JSON.parse(stdout) as {
 			baseRefName?: string;
 			isDraft?: boolean;
@@ -179,31 +198,161 @@ async function openPr(): Promise<PrInfo | undefined> {
 	}
 }
 
-async function resolveBaseRef(base: string): Promise<string | undefined> {
+export async function resolveBaseRef(
+	verifyRef: GuardDeps["verifyRef"],
+	base: string,
+): Promise<string | undefined> {
 	for (const candidate of [`origin/${base}`, base]) {
-		try {
-			await run("git", ["rev-parse", "--verify", "-q", candidate]);
-			return candidate;
-		} catch {
-		}
+		if (await verifyRef(candidate)) return candidate;
 	}
 	return undefined;
 }
 
+// A push may run from a worktree checked out on another branch, so the diff
+// head is the pushed branch itself: local first (what the push uploads), then
+// the remote ref.
+export async function headRefFor(
+	verifyRef: GuardDeps["verifyRef"],
+	branch: string,
+): Promise<string | undefined> {
+	for (const candidate of [branch, `origin/${branch}`]) {
+		if (await verifyRef(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+// Walk a PR stack down to its root base: follow each base's own open PR until
+// the base is an integration branch, has no open PR, or a cycle is detected.
+// Comparing against a stale feature-branch remote would inflate the diff.
+export async function rootBaseRef(
+	deps: Pick<GuardDeps, "gh">,
+	branch: string,
+	config: Config,
+	defaultBranch?: string,
+): Promise<{ compareRef?: string; pr?: PrInfo }> {
+	const visited = new Set<string>([branch]);
+	let current = branch;
+	let pr = await prForBranch(deps.gh, current);
+	while (pr) {
+		const base = pr.base;
+		if (isIntegrationBranch(base, config, defaultBranch) || visited.has(base)) {
+			return { compareRef: base, pr };
+		}
+		visited.add(base);
+		const parent = await prForBranch(deps.gh, base);
+		if (!parent) return { compareRef: base, pr };
+		current = base;
+		pr = parent;
+	}
+	return {};
+}
+
+export interface RefEvaluation {
+	target: string;
+	pr?: PrInfo;
+	compareRef?: string;
+	stats?: DiffStats;
+	protectedBranch: boolean;
+}
+
+// Evaluate one pushed branch against the base of its own PR (or the default
+// branch when it has none), walking feature-branch stacks to their root.
+export async function evaluateTarget(
+	deps: GuardDeps,
+	config: Config,
+	target: string,
+	defaultBranch?: string,
+): Promise<RefEvaluation> {
+	const evaluation: RefEvaluation = {
+		target,
+		protectedBranch: matchesProtected(target, config, defaultBranch),
+	};
+	const { compareRef, pr } = await rootBaseRef(deps, target, config, defaultBranch);
+	evaluation.pr = pr;
+	const baseName = pr ? compareRef : defaultBranch;
+	if (!baseName) return evaluation;
+	const baseRef = await resolveBaseRef(deps.verifyRef, baseName);
+	if (!baseRef) return evaluation;
+	evaluation.compareRef = baseRef;
+	const headRef = await headRefFor(deps.verifyRef, target);
+	if (!headRef) return evaluation;
+	evaluation.stats = await deps.diffStats(baseRef, headRef);
+	return evaluation;
+}
+
 // Three-dot diff: changes since the merge base, matching what GitHub sees.
-async function diffStats(
+async function gitDiffStats(
 	baseRef: string,
-): Promise<{ files: number; commits: number } | undefined> {
+	headRef: string,
+): Promise<DiffStats | undefined> {
 	try {
 		const [diff, commits] = await Promise.all([
-			run("git", ["diff", "--name-only", `${baseRef}...HEAD`], { maxBuffer: 1 << 24 }),
-			run("git", ["rev-list", "--count", `${baseRef}...HEAD`]),
+			run("git", ["diff", "--name-only", `${baseRef}...${headRef}`], { maxBuffer: 1 << 24 }),
+			run("git", ["rev-list", "--count", `${baseRef}...${headRef}`]),
 		]);
 		const files = diff.stdout.split("\n").filter((line) => line.trim()).length;
 		return { files, commits: Number.parseInt(commits.stdout.trim(), 10) };
 	} catch {
 		return undefined;
 	}
+}
+
+function realDeps(): GuardDeps {
+	return {
+		gh: async (args) => (await run("gh", args)).stdout,
+		verifyRef: async (name) => {
+			try {
+				await run("git", ["rev-parse", "--verify", "-q", name]);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		diffStats: gitDiffStats,
+	};
+}
+
+function refLine(ev: RefEvaluation, config: Config): string {
+	const size = ev.stats
+		? `${ev.stats.files} files / ${ev.stats.commits} commits vs ${ev.compareRef}`
+		: "diff size unknown (base not resolvable)";
+	const reason = ev.protectedBranch ? "targets a protected branch" : "diff is large";
+	return `${ev.target} ${reason}: ${size} (threshold: ${config.threshold})`;
+}
+
+export interface Decision {
+	action: "allow" | "warn" | "confirm";
+	summary: string;
+	draftNote?: string;
+}
+
+// Aggregate per-branch evaluations: block (confirm) when at least one branch
+// Aggregate per-branch evaluations: block (confirm) when at least one branch
+// trips the guard and is not on a warn-only path; warn when every tripping
+// branch is on one (no open PR yet, or a draft PR when drafts only warn).
+export function decide(evaluations: RefEvaluation[], config: Config): Decision {
+	const warnOnly = (ev: RefEvaluation) =>
+		!ev.protectedBranch && (!ev.pr || (ev.pr.isDraft && config.draftAction === "warn"));
+	const significant = evaluations.filter((ev) => {
+		const over = ev.stats !== undefined && ev.stats.files > config.threshold;
+		return ev.protectedBranch || over;
+	});
+	if (significant.length === 0) return { action: "allow", summary: "" };
+
+	const lines = significant.map((ev) => refLine(ev, config));
+	const inspect = significant
+		.filter((ev) => ev.compareRef)
+		.map((ev) => `git diff --stat ${ev.compareRef}...${ev.target}`);
+	const summary = inspect.length > 0 ? `${lines.join("; ")}. Inspect: ${inspect.join("; ")}` : `${lines.join("; ")}.`;
+
+	const draft = significant.find((ev) => ev.pr?.isDraft);
+	const draftNote = draft
+		? "The open PR is a draft; review requests and CODEOWNERS notifications only fire once it is marked ready, but the mis-merge is already in."
+		: undefined;
+
+	return significant.every(warnOnly)
+		? { action: "warn", summary, draftNote }
+		: { action: "confirm", summary, draftNote };
 }
 
 async function main(pi: ExtensionAPI) {
@@ -220,49 +369,24 @@ async function main(pi: ExtensionAPI) {
 
 		if (!(await insideWorkTree())) return;
 
-		const cwd = process.cwd();
-		const config = loadConfig(cwd);
+		const config = loadConfig(process.cwd());
+		const deps = realDeps();
 		const branch = await currentBranch();
-		const targets = segments.flatMap((args) => pushTargets(args, branch));
+		const targets = [...new Set(segments.flatMap((args) => pushTargets(args, branch)))];
 		const defaultBranchName = await defaultBranch();
 
-		const protectedTargets = targets.filter((target) =>
-			matchesProtected(target, config, defaultBranchName),
-		);
-
-		// Compare base: the open PR's base when there is one, otherwise the
-		// default branch (what a push would eventually land on).
-		const pr = await openPr();
-		let compareRef = pr ? await resolveBaseRef(pr.base) : undefined;
-		if (!pr && defaultBranchName) {
-			compareRef = await resolveBaseRef(defaultBranchName);
+		// Each pushed branch is evaluated independently, against the base of its
+		// own PR (stacks walked to their root), not the checked-out branch's PR.
+		const evaluations: RefEvaluation[] = [];
+		for (const target of targets) {
+			evaluations.push(await evaluateTarget(deps, config, target, defaultBranchName));
 		}
-		const stats = compareRef ? await diffStats(compareRef) : undefined;
-		const overThreshold = stats !== undefined && stats.files > config.threshold;
+		const decision = decide(evaluations, config);
+		if (decision.action === "allow") return;
 
-		// No measurable base: nothing to protect, fail open.
-		if (protectedTargets.length === 0 && !overThreshold) return;
-
-		const statLine = stats
-			? `${stats.files} files / ${stats.commits} commits vs ${compareRef} (threshold: ${config.threshold})`
-			: "diff size unknown (base not resolvable)";
-		const inspect = compareRef ? `\nInspect: git diff --stat ${compareRef}...HEAD` : "";
-		const summary = protectedTargets.length
-			? `Push targets protected branch(es): ${protectedTargets.join(", ")}. ${statLine}.${inspect}`
-			: `Push diff is large: ${statLine}.${inspect}`;
-
-		const draftNote = pr?.isDraft
-			? "The open PR is a draft; review requests and CODEOWNERS notifications only fire once it is marked ready, but the mis-merge is already in."
-			: undefined;
-
-		// Non-blocking warning paths: draft PRs when draftAction is warn, and
-		// no open PR at all (nothing to review yet, so nothing to protect).
-		const warnOnly =
-			(protectedTargets.length === 0 && !pr) ||
-			(pr?.isDraft && config.draftAction === "warn" && protectedTargets.length === 0);
-		if (warnOnly) {
+		if (decision.action === "warn") {
 			if (ctx.hasUI) {
-				await ctx.ui.notify(`Push blast-radius guard: ${summary}`, "warning");
+				await ctx.ui.notify(`Push blast-radius guard: ${decision.summary}`, "warning");
 			}
 			return;
 		}
@@ -270,19 +394,19 @@ async function main(pi: ExtensionAPI) {
 		if (!ctx.hasUI) {
 			return {
 				block: true,
-				reason: `Push stopped by blast-radius guard. ${summary} No UI is available to ask the user: explain the situation in chat and wait for explicit approval; if approved, re-run with ALLOW_BIG_PUSH=1 prepended to the git push.${draftNote ? ` ${draftNote}` : ""}`,
+				reason: `Push stopped by blast-radius guard. ${decision.summary} No UI is available to ask the user: explain the situation in chat and wait for explicit approval; if approved, re-run with ALLOW_BIG_PUSH=1 prepended to the git push.${decision.draftNote ? ` ${decision.draftNote}` : ""}`,
 			};
 		}
 
 		const ok = await ctx.ui.confirm(
 			"Push blast-radius guard",
-			`${summary}${draftNote ? `\n\n${draftNote}` : ""}\n\nAllow this push?`,
+			`${decision.summary}${decision.draftNote ? `\n\n${decision.draftNote}` : ""}\n\nAllow this push?`,
 		);
 		if (ok) return;
 
 		return {
 			block: true,
-			reason: `The user declined this push. ${summary} Usual causes: the wrong base was merged into the branch, or the push targets a protected branch by mistake. Remediation: inspect the diff with git diff --stat${compareRef ? ` ${compareRef}...HEAD` : " <base>...HEAD"}, check the PR base branch, and to undo a wrong merge ask the user before any history rewrite (git reset --soft <correct-parent>, then rebuild the stack).`,
+			reason: `The user declined this push. ${decision.summary} Usual causes: the wrong base was merged into the branch, or the push targets a protected branch by mistake. Remediation: inspect the diff with the git diff --stat command shown above, check the PR base branch, and to undo a wrong merge ask the user before any history rewrite (git reset --soft <correct-parent>, then rebuild the stack).`,
 		};
 	});
 }
