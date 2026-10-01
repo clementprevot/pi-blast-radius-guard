@@ -5,15 +5,15 @@ Thanks for considering a contribution. Contributing here is easy: no build step,
 ## Setup
 
 ```bash
-corepack enable   # activates Yarn 4 (pinned in package.json)
-yarn install
+npm install
 ```
 
 ## Before you open a PR
 
 ```bash
-yarn test        # node:test, runs on the current Node (>= 22.6)
-yarn typecheck   # tsc --noEmit
+```bash
+npm test        # node:test, runs on the current Node (>= 22.6)
+npm run typecheck   # tsc --noEmit
 ```
 
 Then try the extension in a live session:
