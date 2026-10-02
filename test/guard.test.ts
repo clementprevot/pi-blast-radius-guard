@@ -83,13 +83,10 @@ test("matchesProtected honors default branch protection", () => {
 import {
 	decide,
 	evaluateTarget,
-	isIntegrationBranch,
-	rootBaseRef,
 	stackPushWithoutAtomic,
 	type DiffStats,
 	type GuardDeps,
 } from "../index.ts";
-
 interface FakePr {
 	baseRefName: string;
 	isDraft?: boolean;
@@ -100,9 +97,10 @@ function fakeDeps(options: {
 	prs?: Record<string, FakePr>;
 	refs?: string[];
 	stats?: Record<string, DiffStats>;
+	shas?: Record<string, string>;
 	ghCalls?: string[][];
 }): GuardDeps {
-	const { prs = {}, refs = [], stats = {}, ghCalls = [] } = options;
+	const { prs = {}, refs = [], stats = {}, shas = {}, ghCalls = [] } = options;
 	return {
 		gh: async (args) => {
 			ghCalls.push(args);
@@ -114,17 +112,12 @@ function fakeDeps(options: {
 			throw new Error(`unexpected gh args: ${args.join(" ")}`);
 		},
 		verifyRef: async (name) => refs.includes(name),
+		refSha: async (name) => shas[name],
 		diffStats: async (baseRef, headRef) => stats[`${baseRef}...${headRef}`],
 	};
 }
 
 const CONFIG: Config = { ...DEFAULT_CONFIG };
-
-test("isIntegrationBranch covers protected, default, and staging branches", () => {
-	assert.equal(isIntegrationBranch("preprod", CONFIG, "master"), true);
-	assert.equal(isIntegrationBranch("master", CONFIG, "master"), true);
-	assert.equal(isIntegrationBranch("gh-scope-core", CONFIG, "master"), false);
-});
 
 test("evaluateTarget uses the pushed branch's PR, not the checked-out branch's", async () => {
 	const ghCalls: string[][] = [];
@@ -149,32 +142,22 @@ test("evaluateTarget uses the pushed branch's PR, not the checked-out branch's",
 	assert.ok(!ghCalls.some((args) => args.includes("gh-scope-ui")));
 });
 
-test("evaluateTarget walks a two-PR stack to the integration branch", async () => {
+test("evaluateTarget measures each branch against its own PR base, not the stack root", async () => {
+	const ghCalls: string[][] = [];
 	const deps = fakeDeps({
 		prs: {
 			"stack-1": { baseRefName: "stack-0", state: "OPEN" },
 			"stack-0": { baseRefName: "preprod", state: "OPEN" },
 		},
-		// origin/stack-0 exists but is stale; only the preprod ref is a valid root.
 		refs: ["origin/stack-0", "origin/preprod", "stack-1"],
-		stats: { "origin/preprod...stack-1": { files: 12, commits: 3 } },
+		stats: { "origin/stack-0...stack-1": { files: 12, commits: 3 } },
+		ghCalls,
 	});
 
 	const evaluation = await evaluateTarget(deps, CONFIG, "stack-1", "master");
-	assert.equal(evaluation.compareRef, "origin/preprod");
+	assert.equal(evaluation.compareRef, "origin/stack-0");
 	assert.deepEqual(evaluation.stats, { files: 12, commits: 3 });
-});
-
-test("rootBaseRef terminates on a PR-base cycle", async () => {
-	const deps = fakeDeps({
-		prs: {
-			a: { baseRefName: "b", state: "OPEN" },
-			b: { baseRefName: "a", state: "OPEN" },
-		},
-	});
-
-	const result = await rootBaseRef(deps, "a", CONFIG, "master");
-	assert.ok(result.root);
+	assert.equal(ghCalls.length, 1, "no PR-stack walk: one gh call for the pushed branch only");
 });
 
 test("a wrong base merged into the branch still blocks at the right base", async () => {
@@ -251,23 +234,33 @@ test("a draft PR with draftAction warn only warns", async () => {
 	assert.match(decision.draftNote ?? "", /draft/);
 });
 
+test("a draft PR warns by default instead of asking", async () => {
+	const deps = fakeDeps({
+		prs: { feature: { baseRefName: "preprod", state: "OPEN", isDraft: true } },
+		refs: ["origin/preprod", "feature"],
+		stats: { "origin/preprod...feature": { files: 600, commits: 40 } },
+	});
+
+	const decision = decide([await evaluateTarget(deps, DEFAULT_CONFIG, "feature", "master")], DEFAULT_CONFIG);
+	assert.equal(decision.action, "warn");
+	assert.match(decision.draftNote ?? "", /draft/);
+});
+
 test("pushing the stack tip alone flags the stale base GitHub will show", async () => {
 	const deps = fakeDeps({
 		prs: {
 			ui: { baseRefName: "core", state: "OPEN" },
 			core: { baseRefName: "preprod", state: "OPEN" },
 		},
-		refs: ["origin/core", "origin/preprod", "ui"],
-		stats: {
-			"origin/preprod...ui": { files: 23, commits: 4 },
-			"origin/core...ui": { files: 340, commits: 30 },
-		},
+		refs: ["origin/core", "ui"],
+		shas: { core: "local-base-sha", "origin/core": "remote-base-sha" },
+		stats: { "origin/core...ui": { files: 340, commits: 30 } },
 	});
 
 	const evaluation = await evaluateTarget(deps, CONFIG, "ui", "master", new Set(["ui"]));
-	assert.equal(evaluation.stats?.files, 23);
-	assert.equal(evaluation.visibleRef, "origin/core");
-	assert.equal(evaluation.visibleStats?.files, 340);
+	assert.equal(evaluation.compareRef, "origin/core");
+	assert.equal(evaluation.stats?.files, 340);
+	assert.equal(evaluation.staleBase, true);
 
 	const decision = decide([evaluation], CONFIG);
 	assert.equal(decision.action, "confirm");
@@ -282,10 +275,7 @@ test("pushing the whole stack projects the post-push base and allows", async () 
 			core: { baseRefName: "preprod", state: "OPEN" },
 		},
 		refs: ["origin/preprod", "core", "ui"],
-		stats: {
-			"origin/preprod...ui": { files: 23, commits: 4 },
-			"core...ui": { files: 12, commits: 2 },
-		},
+		stats: { "core...ui": { files: 12, commits: 2 } },
 	});
 
 	const evaluation = await evaluateTarget(
@@ -295,8 +285,9 @@ test("pushing the whole stack projects the post-push base and allows", async () 
 		"master",
 		new Set(["core", "ui"]),
 	);
-	assert.equal(evaluation.visibleRef, "core");
-	assert.equal(evaluation.visibleStats?.files, 12);
+	assert.equal(evaluation.compareRef, "core");
+	assert.equal(evaluation.stats?.files, 12);
+	assert.equal(evaluation.staleBase, undefined);
 	assert.equal(decide([evaluation], CONFIG).action, "allow");
 });
 

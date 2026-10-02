@@ -24,15 +24,13 @@ export interface Config {
 	protectedBranches: string[];
 	protectDefaultBranch: boolean;
 	draftAction: "warn" | "block";
-	integrationBranches: string[];
 }
 
 export const DEFAULT_CONFIG: Config = {
 	threshold: 50,
 	protectedBranches: ["main", "master", "prod"],
 	protectDefaultBranch: true,
-	draftAction: "block",
-	integrationBranches: ["preprod", "develop", "staging"],
+	draftAction: "warn",
 };
 
 function readConfigFile(path: string): Partial<Config> | undefined {
@@ -77,12 +75,6 @@ export function matchesProtected(branch: string, config: Config, defaultBranch?:
 	const candidates = [...config.protectedBranches];
 	if (config.protectDefaultBranch && defaultBranch) candidates.push(defaultBranch);
 	return nameMatches(branch, candidates);
-}
-
-// Integration branches are the roots a PR stack should ultimately target:
-// protected branches, the default branch, and well-known staging branches.
-export function isIntegrationBranch(branch: string, config: Config, defaultBranch?: string): boolean {
-	return matchesProtected(branch, config, defaultBranch) || nameMatches(branch, config.integrationBranches);
 }
 
 export function subcommands(command: string): string[] {
@@ -170,6 +162,7 @@ function currentBranch(): Promise<string | undefined> {
 export interface GuardDeps {
 	gh(args: string[]): Promise<string>;
 	verifyRef(name: string): Promise<boolean>;
+	refSha(name: string): Promise<string | undefined>;
 	diffStats(baseRef: string, headRef: string): Promise<DiffStats | undefined>;
 }
 
@@ -221,51 +214,21 @@ export async function headRefFor(
 	return undefined;
 }
 
-// Walk a PR stack down to its root base: follow each base's own open PR until
-// the base is an integration branch, has no open PR, or a cycle is detected.
-// Comparing against a stale feature-branch remote would inflate the diff.
-export async function rootBaseRef(
-	deps: Pick<GuardDeps, "gh">,
-	branch: string,
-	config: Config,
-	defaultBranch?: string,
-): Promise<{ root?: string; pr?: PrInfo }> {
-	const visited = new Set<string>([branch]);
-	const pr = await prForBranch(deps.gh, branch);
-	if (!pr) return {};
-	let currentPr = pr;
-	while (currentPr) {
-		const base = currentPr.base;
-		if (isIntegrationBranch(base, config, defaultBranch) || visited.has(base)) {
-			return { root: base, pr };
-		}
-		visited.add(base);
-		const parent = await prForBranch(deps.gh, base);
-		if (!parent) return { root: base, pr };
-		currentPr = parent;
-	}
-	return {};
-}
-
 export interface RefEvaluation {
 	target: string;
 	pr?: PrInfo;
 	compareRef?: string;
 	stats?: DiffStats;
-	// What GitHub resolves the PR diff against after this push lands: the
-	// immediate PR base as origin holds it (or the local branch when this same
-	// command pushes the base).
-	visibleRef?: string;
-	visibleStats?: DiffStats;
+	// The PR base exists locally at a different commit than origin holds, so
+	// GitHub keeps resolving the PR against the stale origin ref until the
+	// base is pushed too.
+	staleBase?: boolean;
 	baseMissing?: boolean;
 	protectedBranch: boolean;
 }
-
-// Evaluate one pushed branch against the base of its own PR (or the default
-// branch when it has none), walking feature-branch stacks to their root. A
-// second measurement covers what GitHub shows for the PR right now, which
-// differs from the merge blast when the immediate base is a stale feature
-// branch.
+// Measure one pushed branch against the base its PR will resolve against after
+// the push (local branch when the same command pushes the base, else the base as
+// origin holds it): what GitHub shows reviewers is the blast radius that matters.
 export async function evaluateTarget(
 	deps: GuardDeps,
 	config: Config,
@@ -277,51 +240,32 @@ export async function evaluateTarget(
 		target,
 		protectedBranch: matchesProtected(target, config, defaultBranch),
 	};
-	const { root, pr } = await rootBaseRef(deps, target, config, defaultBranch);
+	const pr = await prForBranch(deps.gh, target);
 	evaluation.pr = pr;
 	const headRef = await headRefFor(deps.verifyRef, target);
 	if (!headRef) return evaluation;
 
-	if (!pr) {
-		// No PR on the pushed branch: fall back to the default branch, the base
-		// a push would eventually land on.
-		if (!defaultBranch) return evaluation;
-		const baseRef = await resolveBaseRef(deps.verifyRef, defaultBranch);
-		if (!baseRef) return evaluation;
-		evaluation.compareRef = baseRef;
-		evaluation.stats = await deps.diffStats(baseRef, headRef);
+	const baseName = pr ? pr.base : defaultBranch;
+	if (!baseName) return evaluation;
+
+	const baseRef =
+		pushedTargets.has(baseName) && (await deps.verifyRef(baseName))
+			? baseName
+			: await resolveBaseRef(deps.verifyRef, baseName);
+	if (!baseRef) {
+		if (pr) evaluation.baseMissing = true;
 		return evaluation;
 	}
+	evaluation.compareRef = baseRef;
+	evaluation.stats = await deps.diffStats(baseRef, headRef);
 
-	// One measurement covers both views when the immediate base is the stack
-	// root; otherwise the merge blast (vs root) and the diff GitHub displays
-	// right now (vs the immediate base) can differ widely.
-	const visibleBase =
-		pushedTargets.has(pr.base) && (await deps.verifyRef(pr.base))
-			? pr.base
-			: await resolveBaseRef(deps.verifyRef, pr.base);
-	if (root === pr.base) {
-		if (!visibleBase) {
-			evaluation.baseMissing = true;
-			return evaluation;
-		}
-		evaluation.compareRef = visibleBase;
-		evaluation.stats = await deps.diffStats(visibleBase, headRef);
-		evaluation.visibleRef = visibleBase;
-		evaluation.visibleStats = evaluation.stats;
-		return evaluation;
-	}
-
-	const rootRef = root ? await resolveBaseRef(deps.verifyRef, root) : undefined;
-	if (rootRef) {
-		evaluation.compareRef = rootRef;
-		evaluation.stats = await deps.diffStats(rootRef, headRef);
-	}
-	if (!visibleBase) {
-		evaluation.baseMissing = true;
-	} else {
-		evaluation.visibleRef = visibleBase;
-		evaluation.visibleStats = await deps.diffStats(visibleBase, headRef);
+	if (pr && !pushedTargets.has(baseName)) {
+		const [localSha, remoteSha] = await Promise.all([
+			deps.refSha(baseName),
+			deps.refSha(`origin/${baseName}`),
+		]);
+		evaluation.staleBase =
+			localSha !== undefined && remoteSha !== undefined && localSha !== remoteSha;
 	}
 	return evaluation;
 }
@@ -354,6 +298,14 @@ function realDeps(): GuardDeps {
 				return false;
 			}
 		},
+		refSha: async (name) => {
+			try {
+				const r = await run("git", ["rev-parse", name]);
+				return r.stdout.trim();
+			} catch {
+				return undefined;
+			}
+		},
 		diffStats: gitDiffStats,
 	};
 }
@@ -364,8 +316,10 @@ function refLine(ev: RefEvaluation, config: Config): string {
 	if (ev.stats && ev.stats.files > config.threshold) {
 		parts.push(`${ev.stats.files} files / ${ev.stats.commits} commits vs ${ev.compareRef}`);
 	}
-	if (ev.visibleStats && ev.visibleStats.files > config.threshold) {
-		parts.push(`GitHub will show ${ev.visibleStats.files} files vs ${ev.visibleRef} (stale base; push the base branch first)`);
+	if (ev.staleBase && ev.stats && ev.stats.files > config.threshold) {
+		parts.push(
+			`stale base: origin/${ev.pr?.base} is behind the local branch; push the base branch first (or the whole stack with --atomic)`,
+		);
 	}
 	if (ev.baseMissing) {
 		parts.push(`base ${ev.pr?.base} is not available locally; run git fetch origin first`);
@@ -393,26 +347,21 @@ export function decide(evaluations: RefEvaluation[], config: Config): Decision {
 	const warnOnly = (ev: RefEvaluation) =>
 		!ev.protectedBranch && (!ev.pr || (ev.pr.isDraft && config.draftAction === "warn"));
 	const significant = evaluations.filter((ev) => {
-		const overRoot = ev.stats !== undefined && ev.stats.files > config.threshold;
-		const overVisible = ev.visibleStats !== undefined && ev.visibleStats.files > config.threshold;
-		return ev.protectedBranch || overRoot || overVisible || ev.baseMissing === true;
+		const overBase = ev.stats !== undefined && ev.stats.files > config.threshold;
+		return ev.protectedBranch || overBase || ev.baseMissing === true;
 	});
 	if (significant.length === 0) return { action: "allow", summary: "" };
 
 	const lines = significant.map((ev) => refLine(ev, config));
-	const inspect = significant.flatMap((ev) => {
-		const commands: string[] = [];
-		if (ev.compareRef) commands.push(`git diff --stat ${ev.compareRef}...${ev.target}`);
-		if (ev.visibleRef && ev.visibleStats && ev.visibleStats.files > config.threshold) {
-			commands.push(`git diff --stat ${ev.visibleRef}...${ev.target}`);
-		}
-		return commands;
-	});
-	const summary = inspect.length > 0 ? `${lines.join("; ")}. Inspect: ${inspect.join("; ")}` : `${lines.join("; ")}.`;
+	const inspect = significant.flatMap((ev) =>
+		ev.compareRef ? [`git diff --stat ${ev.compareRef}...${ev.target}`] : [],
+	);
+	const summary =
+		inspect.length > 0 ? `${lines.join("; ")}. Inspect: ${inspect.join("; ")}` : `${lines.join("; ")}.`;
 
 	const draft = significant.find((ev) => ev.pr?.isDraft);
 	const draftNote = draft
-		? "The open PR is a draft; review requests and CODEOWNERS notifications only fire once it is marked ready, but the mis-merge is already in."
+		? "The PR is a draft: review requests and CODEOWNERS notifications only fire once it is marked ready."
 		: undefined;
 
 	return significant.every(warnOnly)
@@ -461,8 +410,8 @@ async function main(pi: ExtensionAPI) {
 		const targets = [...new Set(segmentTargets.flat())];
 		const defaultBranchName = await defaultBranch();
 
-		// Each pushed branch is evaluated independently, against the base of its
-		// own PR (stacks walked to their root), not the checked-out branch's PR.
+		// Each pushed branch is evaluated independently, against the base its own
+		// PR resolves against after the push, not the checked-out branch's PR.
 		// pushedTargets lets each evaluation project the post-push origin state.
 		const pushedTargets = new Set(targets);
 		const evaluations: RefEvaluation[] = [];
@@ -471,24 +420,18 @@ async function main(pi: ExtensionAPI) {
 		}
 
 		// A multi-branch stack push without --atomic can land the tip while the
-		// base ref is rejected, which is exactly the stale-base exposure the
-		// visible-diff check tries to prevent. Steer to --atomic or split pushes.
+		// base ref is rejected, leaving GitHub showing the whole stack as the
+		// tip's PR diff. Block and steer to --atomic or split pushes.
 		const nonAtomicStack = stackPushWithoutAtomic(
 			pushSegments.map((segment, i) => ({ targets: segmentTargets[i], atomic: segment.atomic })),
 			new Map(evaluations.map((ev) => [ev.target, ev.pr?.base])),
 		);
 		if (nonAtomicStack) {
 			const { targets: stackTargets, base, tip } = nonAtomicStack;
-			const reason = `Pushing ${stackTargets.join(", ")} without --atomic, where ${tip}'s PR targets ${base}. If a ref is rejected mid-push, git still updates the others, leaving ${base} stale on origin: GitHub would then show the whole stack as ${tip}'s PR diff. Re-run with --atomic, or push ${base} first and the remaining branches after.`;
-			if (!ctx.hasUI) {
-				return {
-					block: true,
-					reason: `Push stopped by blast-radius guard. ${reason} No UI is available to ask the user: explain the situation in chat and wait for explicit approval; if approved, re-run with ALLOW_BIG_PUSH=1 prepended to the git push.`,
-				};
-			}
-			const proceed = await ctx.ui.confirm("Push blast-radius guard", `${reason}\n\nAllow this push?`);
-			if (proceed) return;
-			return { block: true, reason: `The user declined this push. ${reason}` };
+			return {
+				block: true,
+				reason: `Push stopped by blast-radius guard. Pushing ${stackTargets.join(", ")} without --atomic, where ${tip}'s PR targets ${base}. If a ref is rejected mid-push, git still updates the others, leaving ${base} stale on origin: GitHub would then show the whole stack as ${tip}'s PR diff. Re-run the same push with --atomic (compatible with --force-with-lease), or push ${base} first and the remaining branches after. If this push is intentional, re-run with ALLOW_BIG_PUSH=1 prepended to the git push.`,
+			};
 		}
 		const decision = decide(evaluations, config);
 		if (decision.action === "allow") return;
