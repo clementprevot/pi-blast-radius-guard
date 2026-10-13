@@ -11,8 +11,7 @@ npm install
 ## Before you open a PR
 
 ```bash
-```bash
-npm test        # node:test, runs on the current Node (>= 22.6)
+npm test            # node:test, runs on the current Node (>= 22.6)
 npm run typecheck   # tsc --noEmit
 ```
 
@@ -36,9 +35,9 @@ Versions are bumped manually and released by tagging:
 
 ```bash
 npm version patch|minor|major
-git push --follow-tags
+git push --follow-tags origin main
 ```
 
-The `release` GitHub Action publishes to npm on `v*` tags using npm trusted publishing (OIDC) (no npm token is stored in the repo).
+The `release` GitHub Action publishes to npm on `v*` tags using npm trusted publishing (OIDC), so no npm token is stored in the repo.
 
 First publish only: the package name must exist on npm and be linked to this repo as a trusted publisher (npmjs.com, package settings, "Trusted Publisher": repository `clementprevot/pi-blast-radius-guard`, workflow `release.yml`). Publish the first version locally with `npm publish` while logged in, then link the trusted publisher so later tags publish automatically.
