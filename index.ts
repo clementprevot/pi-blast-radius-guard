@@ -270,15 +270,18 @@ export async function evaluateTarget(
 	return evaluation;
 }
 
-// Three-dot diff: changes since the merge base, matching what GitHub sees.
-async function gitDiffStats(
+// Both counts start at the merge base, matching what GitHub shows: a three-dot
+// diff for files, and a two-dot range for the branch's own commits (three dots
+// would also count the commits the base gained since the branch point).
+export async function gitDiffStats(
 	baseRef: string,
 	headRef: string,
+	cwd?: string,
 ): Promise<DiffStats | undefined> {
 	try {
 		const [diff, commits] = await Promise.all([
-			run("git", ["diff", "--name-only", `${baseRef}...${headRef}`], { maxBuffer: 1 << 24 }),
-			run("git", ["rev-list", "--count", `${baseRef}...${headRef}`]),
+			run("git", ["diff", "--name-only", `${baseRef}...${headRef}`], { cwd, maxBuffer: 1 << 24 }),
+			run("git", ["rev-list", "--count", `${baseRef}..${headRef}`], { cwd }),
 		]);
 		const files = diff.stdout.split("\n").filter((line) => line.trim()).length;
 		return { files, commits: Number.parseInt(commits.stdout.trim(), 10) };

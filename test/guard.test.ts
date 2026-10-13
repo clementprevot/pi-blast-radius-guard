@@ -80,9 +80,15 @@ test("matchesProtected honors default branch protection", () => {
 	assert.equal(matchesProtected("develop", off, "develop"), false);
 });
 
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
 	decide,
 	evaluateTarget,
+	gitDiffStats,
 	stackPushWithoutAtomic,
 	type DiffStats,
 	type GuardDeps,
@@ -325,4 +331,41 @@ test("stackPushWithoutAtomic flags only stack pushes without --atomic", () => {
 
 	const single = [{ targets: ["ui"], atomic: false }];
 	assert.equal(stackPushWithoutAtomic(single, prBases), undefined);
+});
+
+// Isolated from the user's git config so signing or hooks cannot break commits.
+const SCRATCH_GIT_ENV = {
+	...process.env,
+	GIT_CONFIG_GLOBAL: "/dev/null",
+	GIT_CONFIG_NOSYSTEM: "1",
+	GIT_AUTHOR_NAME: "test",
+	GIT_AUTHOR_EMAIL: "test@example.com",
+	GIT_COMMITTER_NAME: "test",
+	GIT_COMMITTER_EMAIL: "test@example.com",
+};
+
+function scratchRepo(initialBranch: string) {
+	const dir = mkdtempSync(join(tmpdir(), "blast-radius-guard-"));
+	const git = (...args: string[]) =>
+		execFileSync("git", args, { cwd: dir, env: SCRATCH_GIT_ENV, stdio: "pipe" });
+	const commit = (file: string) => {
+		writeFileSync(join(dir, file), file);
+		git("add", file);
+		git("commit", "-q", "-m", file);
+	};
+	git("init", "-q", "-b", initialBranch);
+	return { dir, git, commit };
+}
+
+test("gitDiffStats counts only the branch's own commits when the base moved on", async (t) => {
+	const repo = scratchRepo("preprod");
+	t.after(() => rmSync(repo.dir, { recursive: true, force: true }));
+
+	repo.commit("root.txt");
+	repo.git("checkout", "-q", "-b", "feature");
+	for (const file of ["a.txt", "b.txt", "c.txt"]) repo.commit(file);
+	repo.git("checkout", "-q", "preprod");
+	for (let i = 1; i <= 5; i++) repo.commit(`preprod-${i}.txt`);
+
+	assert.deepEqual(await gitDiffStats("preprod", "feature", repo.dir), { files: 3, commits: 3 });
 });
