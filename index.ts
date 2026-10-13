@@ -162,7 +162,7 @@ function currentBranch(): Promise<string | undefined> {
 export interface GuardDeps {
 	gh(args: string[]): Promise<string>;
 	verifyRef(name: string): Promise<boolean>;
-	refSha(name: string): Promise<string | undefined>;
+	unpushedCommits(branch: string): Promise<number | undefined>;
 	diffStats(baseRef: string, headRef: string): Promise<DiffStats | undefined>;
 }
 
@@ -219,10 +219,10 @@ export interface RefEvaluation {
 	pr?: PrInfo;
 	compareRef?: string;
 	stats?: DiffStats;
-	// The PR base exists locally at a different commit than origin holds, so
-	// GitHub keeps resolving the PR against the stale origin ref until the
-	// base is pushed too.
-	staleBase?: boolean;
+	// Local commits on the PR base that origin lacks (for example after a rebase):
+	// GitHub keeps resolving the PR against the older origin ref until the base
+	// is pushed too.
+	staleBaseCommits?: number;
 	baseMissing?: boolean;
 	protectedBranch: boolean;
 }
@@ -259,13 +259,15 @@ export async function evaluateTarget(
 	evaluation.compareRef = baseRef;
 	evaluation.stats = await deps.diffStats(baseRef, headRef);
 
-	if (pr && !pushedTargets.has(baseName)) {
-		const [localSha, remoteSha] = await Promise.all([
-			deps.refSha(baseName),
-			deps.refSha(`origin/${baseName}`),
-		]);
-		evaluation.staleBase =
-			localSha !== undefined && remoteSha !== undefined && localSha !== remoteSha;
+	// A local base behind origin (an integration branch nobody pulls) changes
+	// nothing GitHub shows, and a protected base is never one to push.
+	if (
+		pr &&
+		!pushedTargets.has(baseName) &&
+		!matchesProtected(baseName, config, defaultBranch)
+	) {
+		const unpushed = await deps.unpushedCommits(baseName);
+		if (unpushed) evaluation.staleBaseCommits = unpushed;
 	}
 	return evaluation;
 }
@@ -290,6 +292,18 @@ export async function gitDiffStats(
 	}
 }
 
+export async function gitUnpushedCommits(
+	branch: string,
+	cwd?: string,
+): Promise<number | undefined> {
+	try {
+		const r = await run("git", ["rev-list", "--count", `origin/${branch}..${branch}`], { cwd });
+		return Number.parseInt(r.stdout.trim(), 10);
+	} catch {
+		return undefined;
+	}
+}
+
 function realDeps(): GuardDeps {
 	return {
 		gh: async (args) => (await run("gh", args)).stdout,
@@ -301,14 +315,7 @@ function realDeps(): GuardDeps {
 				return false;
 			}
 		},
-		refSha: async (name) => {
-			try {
-				const r = await run("git", ["rev-parse", name]);
-				return r.stdout.trim();
-			} catch {
-				return undefined;
-			}
-		},
+		unpushedCommits: gitUnpushedCommits,
 		diffStats: gitDiffStats,
 	};
 }
@@ -319,9 +326,11 @@ function refLine(ev: RefEvaluation, config: Config): string {
 	if (ev.stats && ev.stats.files > config.threshold) {
 		parts.push(`${ev.stats.files} files / ${ev.stats.commits} commits vs ${ev.compareRef}`);
 	}
-	if (ev.staleBase && ev.stats && ev.stats.files > config.threshold) {
+	if (ev.staleBaseCommits && ev.stats && ev.stats.files > config.threshold) {
+		const base = ev.pr?.base;
+		const commits = ev.staleBaseCommits === 1 ? "1 commit" : `${ev.staleBaseCommits} commits`;
 		parts.push(
-			`stale base: origin/${ev.pr?.base} is behind the local branch; push the base branch first (or the whole stack with --atomic)`,
+			`stale base: local ${base} has ${commits} not on origin/${base}; push the base branch first (or the whole stack with --atomic)`,
 		);
 	}
 	if (ev.baseMissing) {

@@ -89,6 +89,7 @@ import {
 	decide,
 	evaluateTarget,
 	gitDiffStats,
+	gitUnpushedCommits,
 	stackPushWithoutAtomic,
 	type DiffStats,
 	type GuardDeps,
@@ -103,10 +104,10 @@ function fakeDeps(options: {
 	prs?: Record<string, FakePr>;
 	refs?: string[];
 	stats?: Record<string, DiffStats>;
-	shas?: Record<string, string>;
+	unpushed?: Record<string, number>;
 	ghCalls?: string[][];
 }): GuardDeps {
-	const { prs = {}, refs = [], stats = {}, shas = {}, ghCalls = [] } = options;
+	const { prs = {}, refs = [], stats = {}, unpushed = {}, ghCalls = [] } = options;
 	return {
 		gh: async (args) => {
 			ghCalls.push(args);
@@ -118,7 +119,7 @@ function fakeDeps(options: {
 			throw new Error(`unexpected gh args: ${args.join(" ")}`);
 		},
 		verifyRef: async (name) => refs.includes(name),
-		refSha: async (name) => shas[name],
+		unpushedCommits: async (branch) => unpushed[branch],
 		diffStats: async (baseRef, headRef) => stats[`${baseRef}...${headRef}`],
 	};
 }
@@ -259,19 +260,45 @@ test("pushing the stack tip alone flags the stale base GitHub will show", async 
 			core: { baseRefName: "preprod", state: "OPEN" },
 		},
 		refs: ["origin/core", "ui"],
-		shas: { core: "local-base-sha", "origin/core": "remote-base-sha" },
+		unpushed: { core: 2 },
 		stats: { "origin/core...ui": { files: 340, commits: 30 } },
 	});
 
 	const evaluation = await evaluateTarget(deps, CONFIG, "ui", "master", new Set(["ui"]));
 	assert.equal(evaluation.compareRef, "origin/core");
 	assert.equal(evaluation.stats?.files, 340);
-	assert.equal(evaluation.staleBase, true);
+	assert.equal(evaluation.staleBaseCommits, 2);
 
 	const decision = decide([evaluation], CONFIG);
 	assert.equal(decision.action, "confirm");
 	assert.match(decision.summary, /340 files/);
-	assert.match(decision.summary, /stale base/);
+	assert.match(decision.summary, /stale base: local core has 2 commits not on origin\/core/);
+});
+
+test("a local base behind origin is not a stale base", async () => {
+	const deps = fakeDeps({
+		prs: { feature: { baseRefName: "preprod", state: "OPEN" } },
+		refs: ["origin/preprod", "feature"],
+		unpushed: { preprod: 0 },
+		stats: { "origin/preprod...feature": { files: 53, commits: 14 } },
+	});
+
+	const evaluation = await evaluateTarget(deps, CONFIG, "feature", "master");
+	assert.equal(evaluation.staleBaseCommits, undefined);
+	assert.doesNotMatch(decide([evaluation], CONFIG).summary, /stale base/);
+});
+
+test("a protected base is never reported as stale", async () => {
+	const deps = fakeDeps({
+		prs: { feature: { baseRefName: "main", state: "OPEN" } },
+		refs: ["origin/main", "feature"],
+		unpushed: { main: 3 },
+		stats: { "origin/main...feature": { files: 53, commits: 14 } },
+	});
+
+	const evaluation = await evaluateTarget(deps, CONFIG, "feature", "master");
+	assert.equal(evaluation.staleBaseCommits, undefined);
+	assert.doesNotMatch(decide([evaluation], CONFIG).summary, /stale base/);
 });
 
 test("pushing the whole stack projects the post-push base and allows", async () => {
@@ -293,7 +320,7 @@ test("pushing the whole stack projects the post-push base and allows", async () 
 	);
 	assert.equal(evaluation.compareRef, "core");
 	assert.equal(evaluation.stats?.files, 12);
-	assert.equal(evaluation.staleBase, undefined);
+	assert.equal(evaluation.staleBaseCommits, undefined);
 	assert.equal(decide([evaluation], CONFIG).action, "allow");
 });
 
@@ -368,4 +395,22 @@ test("gitDiffStats counts only the branch's own commits when the base moved on",
 	for (let i = 1; i <= 5; i++) repo.commit(`preprod-${i}.txt`);
 
 	assert.deepEqual(await gitDiffStats("preprod", "feature", repo.dir), { files: 3, commits: 3 });
+});
+
+test("gitUnpushedCommits counts local commits missing from origin, never the reverse", async (t) => {
+	const repo = scratchRepo("core");
+	t.after(() => rmSync(repo.dir, { recursive: true, force: true }));
+
+	repo.commit("root.txt");
+	repo.git("update-ref", "refs/remotes/origin/core", "HEAD");
+	repo.commit("local-1.txt");
+	repo.commit("local-2.txt");
+	assert.equal(await gitUnpushedCommits("core", repo.dir), 2);
+
+	repo.git("checkout", "-q", "-b", "upstream");
+	repo.commit("remote-1.txt");
+	repo.git("update-ref", "refs/remotes/origin/core", "HEAD");
+	assert.equal(await gitUnpushedCommits("core", repo.dir), 0, "local core is behind origin/core");
+
+	assert.equal(await gitUnpushedCommits("upstream", repo.dir), undefined, "no origin/upstream");
 });
