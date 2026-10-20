@@ -10,7 +10,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -43,15 +43,17 @@ function readConfigFile(path: string): Partial<Config> | undefined {
 	}
 }
 
-function loadConfig(cwd: string): Config {
+function loadConfig(projectDirs: string[]): Config {
 	const agentDir = process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent");
-	const global = readConfigFile(
+	const layers = [
 		join(agentDir, "extensions", EXTENSION_ID, "config.json"),
-	);
-	const project = readConfigFile(
-		join(cwd, ".pi", "extensions", EXTENSION_ID, "config.json"),
-	);
-	return { ...DEFAULT_CONFIG, ...global, ...project };
+		...projectDirs.map((dir) => join(dir, ".pi", "extensions", EXTENSION_ID, "config.json")),
+	].map(readConfigFile);
+	return Object.assign({ ...DEFAULT_CONFIG }, ...layers);
+}
+
+export function projectConfigDirs(repoRoot: string, pushCwd: string): string[] {
+	return pushCwd === repoRoot ? [repoRoot] : [repoRoot, pushCwd];
 }
 
 export function parseRegex(pattern: string): RegExp | undefined {
@@ -103,18 +105,105 @@ export function subcommands(command: string): string[] {
 	return parts;
 }
 
-// Args following `git push` in a subcommand (env prefixes stripped). Anything
-// else (docker push, `echo push`) yields no segment.
-export function gitPushArgs(subcommand: string): string[] | undefined {
-	let cmd = subcommand.trim();
-	while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(cmd)) {
-		const space = cmd.indexOf(" ");
-		if (space === -1) return undefined;
-		cmd = cmd.slice(space + 1);
+function shellWords(text: string): string[] {
+	const words: string[] = [];
+	let current = "";
+	let inWord = false;
+	let quote: string | undefined;
+	for (const char of text) {
+		if (quote) {
+			if (char === quote) quote = undefined;
+			else current += char;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			inWord = true;
+			continue;
+		}
+		if (/\s/.test(char)) {
+			if (inWord) words.push(current);
+			current = "";
+			inWord = false;
+			continue;
+		}
+		current += char;
+		inWord = true;
 	}
-	const tokens = cmd.split(/\s+/);
-	if (tokens[0] !== "git" || tokens[1] !== "push") return undefined;
-	return tokens.slice(2);
+	if (inWord) words.push(current);
+	return words;
+}
+
+function withoutEnvPrefixes(words: string[]): string[] {
+	let start = 0;
+	while (start < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[start])) start++;
+	return words.slice(start);
+}
+
+const GIT_OPTIONS_WITH_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"]);
+
+function parseGitPush(words: string[]): { dirs: string[]; args: string[] } | undefined {
+	if (words[0] !== "git") return undefined;
+	const dirs: string[] = [];
+	let i = 1;
+	while (i < words.length && words[i].startsWith("-")) {
+		if (!GIT_OPTIONS_WITH_VALUE.has(words[i])) {
+			i += 1;
+			continue;
+		}
+		if (i + 1 >= words.length) return undefined;
+		if (words[i] === "-C") dirs.push(words[i + 1]);
+		i += 2;
+	}
+	if (words[i] !== "push") return undefined;
+	return { dirs, args: words.slice(i + 1) };
+}
+
+// Args following `git push` in a subcommand (env prefixes and git global
+// options stripped). Anything else (docker push, `echo push`) yields no segment.
+export function gitPushArgs(subcommand: string): string[] | undefined {
+	return parseGitPush(withoutEnvPrefixes(shellWords(subcommand)))?.args;
+}
+
+function resolveDir(dir: string, cwd: string | undefined, home: string): string | undefined {
+	const expanded = dir.replace(/^(~|\$HOME|\$\{HOME\})(?=\/|$)/, home);
+	if (/[$`]/.test(expanded)) return undefined;
+	if (expanded.startsWith("/")) return resolve(expanded);
+	return cwd === undefined ? undefined : resolve(cwd, expanded);
+}
+
+function cdTarget(args: string[], cwd: string | undefined, home: string): string | undefined {
+	const operands = args.filter((arg) => !/^-[LPe@]+$/.test(arg));
+	if (operands.length === 0) return home;
+	if (operands[0] === "-") return undefined;
+	return resolveDir(operands[0], cwd, home);
+}
+
+export interface PushInvocation {
+	cwd: string | undefined;
+	args: string[];
+}
+
+// The session directory is not always the pushed repo: follow `cd` and
+// `git -C` so the guard inspects the repo the push actually runs in. A
+// directory it cannot resolve (`cd -`, substitutions) stays undefined and the
+// push is let through, like any other uncertainty.
+export function pushInvocations(command: string, sessionCwd: string, home: string = homedir()): PushInvocation[] {
+	const invocations: PushInvocation[] = [];
+	let cwd: string | undefined = sessionCwd;
+	for (const subcommand of subcommands(command)) {
+		const words = withoutEnvPrefixes(shellWords(subcommand.replace(/^\(+|\)+$/g, "")));
+		if (words[0] === "cd") {
+			cwd = cdTarget(words.slice(1), cwd, home);
+			continue;
+		}
+		const push = parseGitPush(words);
+		if (!push) continue;
+		let pushCwd = cwd;
+		for (const dir of push.dirs) pushCwd = resolveDir(dir, pushCwd, home);
+		invocations.push({ cwd: pushCwd, args: push.args });
+	}
+	return invocations;
 }
 
 // Branch names a push would update. Bare refspecs are taken as-is, `src:dst`
@@ -137,23 +226,23 @@ export function pushTargets(args: string[], currentBranch?: string): string[] {
 	return targets;
 }
 
-function insideWorkTree(): Promise<boolean> {
-	return run("git", ["rev-parse", "--is-inside-work-tree"], { maxBuffer: 1 << 20 })
-		.then((r) => r.stdout.trim() === "true")
-		.catch(() => false);
+function repoRoot(cwd: string): Promise<string | undefined> {
+	return run("git", ["rev-parse", "--show-toplevel"], { cwd, maxBuffer: 1 << 20 })
+		.then((r) => r.stdout.trim() || undefined)
+		.catch(() => undefined);
 }
 
-function defaultBranch(): Promise<string | undefined> {
-	return run("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+function defaultBranch(cwd: string): Promise<string | undefined> {
+	return run("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], { cwd })
 		.then((r) => r.stdout.trim().replace(/^origin\//, "") || undefined)
 		.catch(() =>
-			run("gh", ["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef"])
+			run("gh", ["repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef"], { cwd })
 				.then((r) => r.stdout.trim() || undefined)
 				.catch(() => undefined),
 		);
 }
-function currentBranch(): Promise<string | undefined> {
-	return run("git", ["branch", "--show-current"])
+function currentBranch(cwd: string): Promise<string | undefined> {
+	return run("git", ["branch", "--show-current"], { cwd })
 		.then((r) => r.stdout.trim() || undefined)
 		.catch(() => undefined);
 }
@@ -304,19 +393,19 @@ export async function gitUnpushedCommits(
 	}
 }
 
-function realDeps(): GuardDeps {
+function realDeps(cwd: string): GuardDeps {
 	return {
-		gh: async (args) => (await run("gh", args)).stdout,
+		gh: async (args) => (await run("gh", args, { cwd })).stdout,
 		verifyRef: async (name) => {
 			try {
-				await run("git", ["rev-parse", "--verify", "-q", name]);
+				await run("git", ["rev-parse", "--verify", "-q", name], { cwd });
 				return true;
 			} catch {
 				return false;
 			}
 		},
-		unpushedCommits: gitUnpushedCommits,
-		diffStats: gitDiffStats,
+		unpushedCommits: (branch) => gitUnpushedCommits(branch, cwd),
+		diffStats: (baseRef, headRef) => gitDiffStats(baseRef, headRef, cwd),
 	};
 }
 
@@ -381,6 +470,22 @@ export function decide(evaluations: RefEvaluation[], config: Config): Decision {
 		: { action: "confirm", summary, draftNote };
 }
 
+const ACTION_RANK: Record<Decision["action"], number> = { allow: 0, warn: 1, confirm: 2 };
+
+export function mergeDecisions(decisions: Decision[]): Decision {
+	const relevant = decisions.filter((decision) => decision.action !== "allow");
+	if (relevant.length === 0) return { action: "allow", summary: "" };
+	const action = relevant.reduce<Decision["action"]>(
+		(strictest, decision) => (ACTION_RANK[decision.action] > ACTION_RANK[strictest] ? decision.action : strictest),
+		"warn",
+	);
+	return {
+		action,
+		summary: relevant.map((decision) => decision.summary).join(" "),
+		draftNote: relevant.find((decision) => decision.draftNote)?.draftNote,
+	};
+}
+
 // Detect a multi-branch push of a stack without --atomic: git updates each
 // ref independently, so one rejected ref would still push the others and
 // leave the stack base stale on origin while the tip lands. The PR diff
@@ -400,6 +505,44 @@ export function stackPushWithoutAtomic(
 	return undefined;
 }
 
+async function evaluateRepo(
+	root: string,
+	cwd: string,
+	segments: string[][],
+): Promise<{ stackBlock: string } | { decision: Decision }> {
+	const config = loadConfig(projectConfigDirs(root, cwd));
+	const deps = realDeps(cwd);
+	const branch = await currentBranch(cwd);
+	const pushSegments = segments.map((args) => ({ args, atomic: args.includes("--atomic") }));
+	const segmentTargets = pushSegments.map((segment) => pushTargets(segment.args, branch));
+	const targets = [...new Set(segmentTargets.flat())];
+	const defaultBranchName = await defaultBranch(cwd);
+
+	// Each pushed branch is evaluated independently, against the base its own
+	// PR resolves against after the push, not the checked-out branch's PR.
+	// pushedTargets lets each evaluation project the post-push origin state.
+	const pushedTargets = new Set(targets);
+	const evaluations: RefEvaluation[] = [];
+	for (const target of targets) {
+		evaluations.push(await evaluateTarget(deps, config, target, defaultBranchName, pushedTargets));
+	}
+
+	// A multi-branch stack push without --atomic can land the tip while the
+	// base ref is rejected, leaving GitHub showing the whole stack as the
+	// tip's PR diff. Block and steer to --atomic or split pushes.
+	const nonAtomicStack = stackPushWithoutAtomic(
+		pushSegments.map((segment, i) => ({ targets: segmentTargets[i], atomic: segment.atomic })),
+		new Map(evaluations.map((ev) => [ev.target, ev.pr?.base])),
+	);
+	if (nonAtomicStack) {
+		const { targets: stackTargets, base, tip } = nonAtomicStack;
+		return {
+			stackBlock: `Pushing ${stackTargets.join(", ")} without --atomic, where ${tip}'s PR targets ${base}. If a ref is rejected mid-push, git still updates the others, leaving ${base} stale on origin: GitHub would then show the whole stack as ${tip}'s PR diff. Re-run the same push with --atomic (compatible with --force-with-lease), or push ${base} first and the remaining branches after. If this push is intentional, re-run with ALLOW_BIG_PUSH=1 prepended to the git push.`,
+		};
+	}
+	return { decision: decide(evaluations, config) };
+}
+
 async function main(pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		if (!isToolCallEventType("bash", event)) return;
@@ -407,45 +550,33 @@ async function main(pi: ExtensionAPI) {
 		if (!command.includes("push")) return;
 		if (/\bALLOW_BIG_PUSH=1\b/.test(command) || process.env.ALLOW_BIG_PUSH === "1") return;
 
-		const segments = subcommands(command)
-			.map(gitPushArgs)
-			.filter((args): args is string[] => args !== undefined);
-		if (segments.length === 0) return;
+		const invocations = pushInvocations(command, process.cwd());
+		if (invocations.length === 0) return;
 
-		if (!(await insideWorkTree())) return;
+		const repos = new Map<string, { cwd: string; segments: string[][] }>();
+		for (const { cwd, args } of invocations) {
+			if (cwd === undefined) continue;
+			const root = await repoRoot(cwd);
+			if (!root) continue;
+			const repo = repos.get(root) ?? { cwd, segments: [] };
+			repo.segments.push(args);
+			repos.set(root, repo);
+		}
+		if (repos.size === 0) return;
 
-		const config = loadConfig(process.cwd());
-		const deps = realDeps();
-		const branch = await currentBranch();
-		const pushSegments = segments.map((args) => ({ args, atomic: args.includes("--atomic") }));
-		const segmentTargets = pushSegments.map((segment) => pushTargets(segment.args, branch));
-		const targets = [...new Set(segmentTargets.flat())];
-		const defaultBranchName = await defaultBranch();
-
-		// Each pushed branch is evaluated independently, against the base its own
-		// PR resolves against after the push, not the checked-out branch's PR.
-		// pushedTargets lets each evaluation project the post-push origin state.
-		const pushedTargets = new Set(targets);
-		const evaluations: RefEvaluation[] = [];
-		for (const target of targets) {
-			evaluations.push(await evaluateTarget(deps, config, target, defaultBranchName, pushedTargets));
+		const sessionRoot = await repoRoot(process.cwd());
+		const decisions: Decision[] = [];
+		for (const [root, repo] of repos) {
+			const label = root === sessionRoot ? "" : `In ${root}: `;
+			const outcome = await evaluateRepo(root, repo.cwd, repo.segments);
+			if ("stackBlock" in outcome) {
+				return { block: true, reason: `Push stopped by blast-radius guard. ${label}${outcome.stackBlock}` };
+			}
+			const { decision } = outcome;
+			decisions.push(decision.action === "allow" ? decision : { ...decision, summary: `${label}${decision.summary}` });
 		}
 
-		// A multi-branch stack push without --atomic can land the tip while the
-		// base ref is rejected, leaving GitHub showing the whole stack as the
-		// tip's PR diff. Block and steer to --atomic or split pushes.
-		const nonAtomicStack = stackPushWithoutAtomic(
-			pushSegments.map((segment, i) => ({ targets: segmentTargets[i], atomic: segment.atomic })),
-			new Map(evaluations.map((ev) => [ev.target, ev.pr?.base])),
-		);
-		if (nonAtomicStack) {
-			const { targets: stackTargets, base, tip } = nonAtomicStack;
-			return {
-				block: true,
-				reason: `Push stopped by blast-radius guard. Pushing ${stackTargets.join(", ")} without --atomic, where ${tip}'s PR targets ${base}. If a ref is rejected mid-push, git still updates the others, leaving ${base} stale on origin: GitHub would then show the whole stack as ${tip}'s PR diff. Re-run the same push with --atomic (compatible with --force-with-lease), or push ${base} first and the remaining branches after. If this push is intentional, re-run with ALLOW_BIG_PUSH=1 prepended to the git push.`,
-			};
-		}
-		const decision = decide(evaluations, config);
+		const decision = mergeDecisions(decisions);
 		if (decision.action === "allow") return;
 
 		if (decision.action === "warn") {

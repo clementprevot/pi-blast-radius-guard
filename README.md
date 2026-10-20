@@ -12,7 +12,7 @@ Updates ship with `pi update --extensions`. The extension applies to your next s
 
 ## How it works
 
-1. Splits the command chain into subcommands (respecting quotes) and finds each `git push` invocation, stripping environment-variable prefixes like `FOO=1 git push ...`.
+1. Splits the command chain into subcommands (respecting quotes) and finds each `git push` invocation, stripping environment-variable prefixes like `FOO=1 git push ...` and git global options like `git -C <path> push`. It follows `cd` steps and `-C` paths, so a push that runs in another repo than the session's (`cd ~/other-repo && git push`) is evaluated in that repo, with that repo's config.
 2. Computes the branch names the push would update from the refspecs (`git push origin HEAD:main` targets `main`, `git push origin main` targets `main`, flags are skipped, and a bare `git push` defaults to the current branch).
 3. Evaluates each pushed branch independently: it resolves the open PR of that branch (not the checked-out one) and measures one three-dot diff (changes since the merge base) against the base the PR will resolve against after the push: the local branch when the same command pushes that base, otherwise the base as origin holds it. The repo default branch stands in when the branch has no open PR. The commit count also starts at the merge base: it counts only the branch's own commits, never the ones the base gained since. This matches what GitHub shows reviewers, which is the blast radius that matters.
 4. Flags a stale base: when the local PR base has commits that origin lacks (for example after a rebase), GitHub keeps resolving the PR against the older origin ref until the base is pushed too, so an oversized summary line comes with a hint to push the base branch first. A base that is only behind origin (an integration branch you never pull) gets no hint, since GitHub already compares against the newer origin ref. Neither does a protected base: pushing it is never the fix.
@@ -20,14 +20,14 @@ Updates ship with `pi update --extensions`. The extension applies to your next s
 6. Asks you to confirm when any pushed branch targets a protected branch or when the measured diff exceeds the file threshold, with one summary line per offending branch. Draft PRs only warn: a draft pings no reviewers, so the guard notes the size in the conversation and lets the push through.
 When no UI is available (headless session), the push is blocked with an explanation instead of a prompt: the agent is told to explain the situation in chat and wait for your explicit approval. An approved push can be re-run with `ALLOW_BIG_PUSH=1` prepended to the command to skip the guard for that one push.
 
-The guard is intentionally forgiving: outside a git worktree, without gh, or when the base branch cannot be resolved, it fails open and lets the push through. Only pushes with something measurable to protect (a protected target or an oversized diff) trigger a prompt.
+The guard is intentionally forgiving: outside a git worktree, when the push directory cannot be resolved (`cd -`, `cd "$(...)"`), without gh, or when the base branch cannot be resolved, it fails open and lets the push through. Only pushes with something measurable to protect (a protected target or an oversized diff) trigger a prompt.
 
 ## Configuration
 
 Two optional JSON files, merged with project taking precedence over global, which takes precedence over defaults:
 
 - Global: `~/.pi/agent/extensions/blast-radius-guard/config.json`
-- Per project: `<repo>/.pi/extensions/blast-radius-guard/config.json`
+- Per project: `<repo>/.pi/extensions/blast-radius-guard/config.json`, read from the repo the push runs in (its git root, then the push directory when it is a subdirectory), not from the session directory
 
 Schema (shown with defaults):
 

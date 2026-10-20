@@ -5,7 +5,10 @@ import {
 	DEFAULT_CONFIG,
 	gitPushArgs,
 	matchesProtected,
+	mergeDecisions,
 	parseRegex,
+	projectConfigDirs,
+	pushInvocations,
 	pushTargets,
 	subcommands,
 	type Config,
@@ -34,6 +37,71 @@ test("gitPushArgs ignores non-git-push commands", () => {
 	assert.equal(gitPushArgs("echo push something"), undefined);
 	assert.equal(gitPushArgs("git status"), undefined);
 	assert.equal(gitPushArgs("FOO=bar"), undefined);
+});
+
+test("gitPushArgs skips git global options before push", () => {
+	assert.deepEqual(gitPushArgs("git -C /repo push origin main"), ["origin", "main"]);
+	assert.deepEqual(gitPushArgs("git -c push.default=current --no-pager push"), []);
+	assert.equal(gitPushArgs("git -C"), undefined);
+});
+
+test("pushInvocations runs a plain push in the session directory", () => {
+	assert.deepEqual(pushInvocations("git push origin main", "/session", "/home"), [
+		{ cwd: "/session", args: ["origin", "main"] },
+	]);
+});
+
+test("pushInvocations follows cd before the push", () => {
+	assert.deepEqual(pushInvocations("cd /work/repo && git push", "/session", "/home"), [
+		{ cwd: "/work/repo", args: [] },
+	]);
+	assert.deepEqual(pushInvocations("cd sub && git push", "/session", "/home"), [{ cwd: "/session/sub", args: [] }]);
+	assert.deepEqual(pushInvocations("cd /a; cd ../b && git push", "/session", "/home"), [{ cwd: "/b", args: [] }]);
+	assert.deepEqual(pushInvocations('cd "/a b" && git push', "/session", "/home"), [{ cwd: "/a b", args: [] }]);
+	assert.deepEqual(pushInvocations("(cd /a && git push)", "/session", "/home"), [{ cwd: "/a", args: [] }]);
+});
+
+test("pushInvocations expands the home directory", () => {
+	assert.deepEqual(pushInvocations("cd ~/dd/web-ui && git push", "/session", "/home"), [
+		{ cwd: "/home/dd/web-ui", args: [] },
+	]);
+	assert.deepEqual(pushInvocations("cd $HOME/x && git push", "/session", "/home"), [{ cwd: "/home/x", args: [] }]);
+	assert.deepEqual(pushInvocations("cd && git push", "/session", "/home"), [{ cwd: "/home", args: [] }]);
+});
+
+test("pushInvocations applies git -C relative to the current directory", () => {
+	assert.deepEqual(pushInvocations("git -C /repo push origin x", "/session", "/home"), [
+		{ cwd: "/repo", args: ["origin", "x"] },
+	]);
+	assert.deepEqual(pushInvocations("cd /work && git -C repo push", "/session", "/home"), [
+		{ cwd: "/work/repo", args: [] },
+	]);
+});
+
+test("pushInvocations leaves the directory unknown when it cannot be resolved", () => {
+	assert.deepEqual(pushInvocations('cd "$(git rev-parse --show-toplevel)" && git push', "/session", "/home"), [
+		{ cwd: undefined, args: [] },
+	]);
+	assert.deepEqual(pushInvocations("cd - && git push", "/session", "/home"), [{ cwd: undefined, args: [] }]);
+	assert.deepEqual(pushInvocations("git -C $REPO push", "/session", "/home"), [{ cwd: undefined, args: [] }]);
+});
+
+test("projectConfigDirs reads the repo root, then a more specific push directory", () => {
+	assert.deepEqual(projectConfigDirs("/repo", "/repo"), ["/repo"]);
+	assert.deepEqual(projectConfigDirs("/repo", "/repo/pkg"), ["/repo", "/repo/pkg"]);
+});
+
+test("mergeDecisions keeps the strictest action and every summary", () => {
+	const allow = { action: "allow" as const, summary: "" };
+	const warn = { action: "warn" as const, summary: "a: big" };
+	const confirm = { action: "confirm" as const, summary: "b: protected", draftNote: "draft" };
+	assert.deepEqual(mergeDecisions([allow, allow]), { action: "allow", summary: "" });
+	assert.deepEqual(mergeDecisions([allow, warn]), { action: "warn", summary: "a: big", draftNote: undefined });
+	assert.deepEqual(mergeDecisions([warn, confirm]), {
+		action: "confirm",
+		summary: "a: big b: protected",
+		draftNote: "draft",
+	});
 });
 
 test("pushTargets reads bare refspecs and src:dst pairs", () => {
