@@ -44,7 +44,7 @@ function readConfigFile(path: string): Partial<Config> | undefined {
 }
 
 function loadConfig(projectDirs: string[]): Config {
-	const agentDir = process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent");
+	const agentDir = process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent");
 	const layers = [
 		join(agentDir, "extensions", EXTENSION_ID, "config.json"),
 		...projectDirs.map((dir) => join(dir, ".pi", "extensions", EXTENSION_ID, "config.json")),
