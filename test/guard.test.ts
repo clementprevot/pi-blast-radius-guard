@@ -116,6 +116,13 @@ test("pushTargets skips flags", () => {
 	assert.deepEqual(pushTargets(["-f", "origin", "main", "--tags"]), ["main"]);
 });
 
+test("pushTargets skips the values of options that take one", () => {
+	assert.deepEqual(pushTargets(["-o", "ci.skip", "origin", "main"]), ["main"]);
+	assert.deepEqual(pushTargets(["--push-option", "x", "origin", "HEAD:main"]), ["main"]);
+	assert.deepEqual(pushTargets(["--repo", "fork", "origin", "main"]), ["main"]);
+	assert.deepEqual(pushTargets(["-o", "ci.skip", "origin"], "feature"), ["feature"]);
+});
+
 test("pushTargets defaults to the current branch", () => {
 	assert.deepEqual(pushTargets(["origin"], "feature"), ["feature"]);
 	assert.deepEqual(pushTargets([], "feature"), ["feature"]);

@@ -209,17 +209,26 @@ export function pushInvocations(command: string, sessionCwd: string, home: strin
 	return invocations;
 }
 
-// Branch names a push would update. Bare refspecs are taken as-is, `src:dst`
-// contributes dst; flags are skipped.
-export function pushTargets(args: string[], currentBranch?: string): string[] {
+const PUSH_OPTIONS_WITH_VALUE = new Set(["-o", "--push-option", "--receive-pack", "--exec"]);
+
+// Positionals are the repository (a remote name or a URL), then the refspecs.
+function parsePushArgs(args: string[]): { positional: string[]; repo?: string } {
 	const positional: string[] = [];
-	for (const token of args) {
-		if (token.startsWith("-")) continue;
-		positional.push(token);
+	let repo: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const token = args[i];
+		if (token === "--repo") repo = args[++i];
+		else if (token.startsWith("--repo=")) repo = token.slice("--repo=".length);
+		else if (PUSH_OPTIONS_WITH_VALUE.has(token)) i++;
+		else if (!token.startsWith("-")) positional.push(token);
 	}
-	if (positional.length === 0) return currentBranch ? [currentBranch] : [];
-	// First positional is the remote (or a URL); the rest are refspecs.
-	const refspecs = positional.slice(1);
+	return { positional, repo };
+}
+
+// Branch names a push would update. Bare refspecs are taken as-is, `src:dst`
+// contributes dst.
+export function pushTargets(args: string[], currentBranch?: string): string[] {
+	const refspecs = parsePushArgs(args).positional.slice(1);
 	if (refspecs.length === 0) return currentBranch ? [currentBranch] : [];
 	const targets: string[] = [];
 	for (const refspec of refspecs) {
@@ -229,29 +238,11 @@ export function pushTargets(args: string[], currentBranch?: string): string[] {
 	return targets;
 }
 
-const PUSH_OPTIONS_WITH_VALUE = new Set(["-o", "--push-option", "--receive-pack", "--exec"]);
-
-// Repository a push names: the first positional argument (a remote name or a
-// URL), else --repo. Undefined for a bare push, which git resolves from config.
+// Repository a push names: the first positional argument, else --repo.
+// Undefined for a bare push, which git resolves from config.
 export function pushRemote(args: string[]): string | undefined {
-	let repo: string | undefined;
-	for (let i = 0; i < args.length; i++) {
-		const token = args[i];
-		if (token === "--repo") {
-			repo = args[++i];
-			continue;
-		}
-		if (token.startsWith("--repo=")) {
-			repo = token.slice("--repo=".length);
-			continue;
-		}
-		if (PUSH_OPTIONS_WITH_VALUE.has(token)) {
-			i++;
-			continue;
-		}
-		if (!token.startsWith("-")) return token;
-	}
-	return repo;
+	const { positional, repo } = parsePushArgs(args);
+	return positional[0] ?? repo;
 }
 
 // The remote a bare `git push` uses, in git's order of precedence.
