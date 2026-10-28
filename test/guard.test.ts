@@ -9,6 +9,7 @@ import {
 	parseRegex,
 	projectConfigDirs,
 	pushInvocations,
+	pushRemote,
 	pushTargets,
 	subcommands,
 	type Config,
@@ -154,6 +155,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+	configuredPushRemote,
 	decide,
 	evaluateTarget,
 	gitDiffStats,
@@ -481,4 +483,42 @@ test("gitUnpushedCommits counts local commits missing from origin, never the rev
 	assert.equal(await gitUnpushedCommits("core", repo.dir), 0, "local core is behind origin/core");
 
 	assert.equal(await gitUnpushedCommits("upstream", repo.dir), undefined, "no origin/upstream");
+});
+
+test("pushRemote reads the repository a push names", () => {
+	assert.equal(pushRemote(["origin", "main"]), "origin");
+	assert.equal(pushRemote(["--force-with-lease", "upstream", "HEAD:main"]), "upstream");
+	assert.equal(pushRemote(["-o", "ci.skip", "fork", "main"]), "fork");
+	assert.equal(pushRemote(["https://example.com/x.git", "HEAD:main"]), "https://example.com/x.git");
+	assert.equal(pushRemote(["--repo", "fork"]), "fork");
+	assert.equal(pushRemote(["--repo=fork", "--tags"]), "fork");
+	assert.equal(pushRemote(["--tags"]), undefined);
+	assert.equal(pushRemote([]), undefined);
+});
+
+test("configuredPushRemote follows git's precedence for a bare push", async (t) => {
+	const isolation = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+	const previous = Object.fromEntries(Object.keys(isolation).map((key) => [key, process.env[key]]));
+	Object.assign(process.env, isolation);
+	const repo = scratchRepo("feature");
+	t.after(() => {
+		rmSync(repo.dir, { recursive: true, force: true });
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	});
+
+	assert.equal(await configuredPushRemote(repo.dir, "feature"), "origin");
+	repo.git("config", "branch.feature.remote", "upstream");
+	assert.equal(await configuredPushRemote(repo.dir, "feature"), "upstream");
+	repo.git("config", "remote.pushDefault", "fork");
+	assert.equal(await configuredPushRemote(repo.dir, "feature"), "fork");
+	repo.git("config", "branch.feature.pushRemote", "mirror");
+	assert.equal(await configuredPushRemote(repo.dir, "feature"), "mirror");
+	assert.equal(await configuredPushRemote(repo.dir, undefined), "fork");
+});
+
+test("only origin is an allowed remote by default", () => {
+	assert.deepEqual(DEFAULT_CONFIG.allowedRemotes, ["origin"]);
 });

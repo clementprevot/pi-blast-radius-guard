@@ -1,8 +1,9 @@
 /**
  * Push blast-radius guard: intercepts `git push` bash calls and escalates to
  * the user when the push looks like an accident (stacked-PR mis-merge, direct
- * push to a protected branch). Port of a Claude Code PreToolUse hook, with
- * human confirmation instead of a model-facing deny.
+ * push to a protected branch, push to a remote other than origin). Port of a
+ * Claude Code PreToolUse hook, with human confirmation instead of a
+ * model-facing deny.
  *
  * Fails open on uncertainty (no git repo, unresolvable base, gh unavailable):
  * this is an accident detector, not a security boundary.
@@ -24,6 +25,7 @@ export interface Config {
 	protectedBranches: string[];
 	protectDefaultBranch: boolean;
 	draftAction: "warn" | "block";
+	allowedRemotes: string[];
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -31,6 +33,7 @@ export const DEFAULT_CONFIG: Config = {
 	protectedBranches: ["main", "master", "prod"],
 	protectDefaultBranch: true,
 	draftAction: "warn",
+	allowedRemotes: ["origin"],
 };
 
 function readConfigFile(path: string): Partial<Config> | undefined {
@@ -224,6 +227,63 @@ export function pushTargets(args: string[], currentBranch?: string): string[] {
 		if (dst) targets.push(dst);
 	}
 	return targets;
+}
+
+const PUSH_OPTIONS_WITH_VALUE = new Set(["-o", "--push-option", "--receive-pack", "--exec"]);
+
+// Repository a push names: the first positional argument (a remote name or a
+// URL), else --repo. Undefined for a bare push, which git resolves from config.
+export function pushRemote(args: string[]): string | undefined {
+	let repo: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const token = args[i];
+		if (token === "--repo") {
+			repo = args[++i];
+			continue;
+		}
+		if (token.startsWith("--repo=")) {
+			repo = token.slice("--repo=".length);
+			continue;
+		}
+		if (PUSH_OPTIONS_WITH_VALUE.has(token)) {
+			i++;
+			continue;
+		}
+		if (!token.startsWith("-")) return token;
+	}
+	return repo;
+}
+
+// The remote a bare `git push` uses, in git's order of precedence.
+export async function configuredPushRemote(cwd: string, branch: string | undefined): Promise<string> {
+	const keys = [
+		...(branch ? [`branch.${branch}.pushRemote`] : []),
+		"remote.pushDefault",
+		...(branch ? [`branch.${branch}.remote`] : []),
+	];
+	for (const key of keys) {
+		const value = await run("git", ["config", "--get", key], { cwd })
+			.then((r) => r.stdout.trim())
+			.catch(() => "");
+		if (value) return value;
+	}
+	return "origin";
+}
+
+// "." is the local repository, which git also accepts as a remote.
+async function segmentRemotes(
+	root: string,
+	cwd: string,
+	segments: string[][],
+): Promise<{ remote: string; allowed: boolean }[]> {
+	const { allowedRemotes } = loadConfig(projectConfigDirs(root, cwd));
+	const branch = await currentBranch(cwd);
+	const remotes: { remote: string; allowed: boolean }[] = [];
+	for (const args of segments) {
+		const remote = pushRemote(args) ?? (await configuredPushRemote(cwd, branch));
+		remotes.push({ remote, allowed: remote === "." || allowedRemotes.includes(remote) });
+	}
+	return remotes;
 }
 
 function repoRoot(cwd: string): Promise<string | undefined> {
@@ -565,6 +625,32 @@ async function main(pi: ExtensionAPI) {
 		if (repos.size === 0) return;
 
 		const sessionRoot = await repoRoot(process.cwd());
+		const offRemotes = new Set<string>();
+		for (const [root, repo] of repos) {
+			const where = root === sessionRoot ? "" : ` (in ${root})`;
+			const remotes = await segmentRemotes(root, repo.cwd, repo.segments);
+			for (const { remote, allowed } of remotes) if (!allowed) offRemotes.add(`"${remote}"${where}`);
+			repo.segments = repo.segments.filter((_, i) => remotes[i].allowed);
+			if (repo.segments.length === 0) repos.delete(root);
+		}
+		if (offRemotes.size > 0) {
+			const summary = `This push goes to ${[...offRemotes].join(", ")}, outside the allowed remotes (allowedRemotes, origin by default).`;
+			if (!ctx.hasUI) {
+				return {
+					block: true,
+					reason: `Push stopped by blast-radius guard. ${summary} No UI is available to ask the user: explain the situation in chat and wait for explicit approval; if approved, re-run with ALLOW_BIG_PUSH=1 prepended to the git push.`,
+				};
+			}
+			const ok = await ctx.ui.confirm("Push blast-radius guard", `${summary}\n\nAllow this push?`);
+			if (!ok) {
+				return {
+					block: true,
+					reason: `The user declined this push. ${summary} Push to origin instead, or ask the user why this remote is needed.`,
+				};
+			}
+		}
+
+		// The checks below measure against origin, so they only cover pushes to an allowed remote.
 		const decisions: Decision[] = [];
 		for (const [root, repo] of repos) {
 			const label = root === sessionRoot ? "" : `In ${root}: `;
