@@ -13,7 +13,7 @@ Updates ship with `pi update --extensions`. The extension applies to your next s
 ## How it works
 
 1. Splits the command chain into subcommands (respecting quotes) and finds each `git push` invocation, stripping environment-variable prefixes like `FOO=1 git push ...` and git global options like `git -C <path> push`. It follows `cd` steps and `-C` paths, so a push that runs in another repo than the session's (`cd ~/other-repo && git push`) is evaluated in that repo, with that repo's config.
-2. Asks you to confirm a push to a remote outside `allowedRemotes` (only `origin` by default): a remote named on the command line, a URL, `--repo`, or the remote a bare `git push` resolves from `branch.<name>.pushRemote`, `remote.pushDefault` or `branch.<name>.remote`. The size checks below compare against origin, so they only run for the pushes that go to an allowed remote.
+2. Asks you to confirm a push to a remote outside `allowedRemotes` (only `origin` by default). The remote is the first argument that names a configured remote, `.` or a URL, then `--repo`, then the remote a bare `git push` resolves from `branch.<name>.pushRemote`, `remote.pushDefault` or `branch.<name>.remote`. Arguments the guard cannot read (`$VAR`, `$(...)`, redirections such as `2>&1`) never count as a remote, so such a push falls back to the remote git picks from config; a remote hidden in a variable (`git push $R main`) goes unchecked. The size checks below compare against origin, so they only run for the pushes that go to an allowed remote.
 3. Computes the branch names the push would update from the refspecs (`git push origin HEAD:main` targets `main`, `git push origin main` targets `main`, flags are skipped, and a bare `git push` defaults to the current branch).
 4. Evaluates each pushed branch independently: it resolves the open PR of that branch (not the checked-out one) and measures one three-dot diff (changes since the merge base) against the base the PR will resolve against after the push: the local branch when the same command pushes that base, otherwise the base as origin holds it. The repo default branch stands in when the branch has no open PR. The commit count also starts at the merge base: it counts only the branch's own commits, never the ones the base gained since. This matches what GitHub shows reviewers, which is the blast radius that matters.
 5. Flags a stale base: when the local PR base has commits that origin lacks (for example after a rebase), GitHub keeps resolving the PR against the older origin ref until the base is pushed too, so an oversized summary line comes with a hint to push the base branch first. A base that is only behind origin (an integration branch you never pull) gets no hint, since GitHub already compares against the newer origin ref. Neither does a protected base: pushing it is never the fix.
@@ -25,10 +25,12 @@ The guard is intentionally forgiving: outside a git worktree, when the push dire
 
 ## Configuration
 
-Two optional JSON files, merged with project taking precedence over global, which takes precedence over defaults:
+Two optional JSON files over the defaults:
 
 - Global: `~/.pi/agent/extensions/blast-radius-guard/config.json`
 - Per project: `<repo>/.pi/extensions/blast-radius-guard/config.json`, read from the repo the push runs in (its git root, then the push directory when it is a subdirectory), not from the session directory
+
+Any checkout can ship a `.pi` folder, so a project config can only make the guard stricter: the lowest `threshold` wins, `protectedBranches` add up, and `protectDefaultBranch: true` or `draftAction: "block"` win. A repo listed in the global `trustedRepos` gets its project config applied in full instead. `allowedRemotes` and `trustedRepos` are always read from the global config.
 
 Schema (shown with defaults):
 
@@ -38,7 +40,8 @@ Schema (shown with defaults):
 	"protectedBranches": ["main", "master", "prod"],
 	"protectDefaultBranch": true,
 	"draftAction": "warn",
-	"allowedRemotes": ["origin"]
+	"allowedRemotes": ["origin"],
+	"trustedRepos": []
 }
 ```
 
@@ -47,6 +50,7 @@ Schema (shown with defaults):
 - `protectDefaultBranch`: also treat the repo's default branch (resolved via git, falling back to gh) as protected.
 - `draftAction`: `"warn"` (default) only warns on draft-PR pushes, since a draft pings nobody; `"block"` asks for confirmation instead.
 - `allowedRemotes`: remote names a push may target without a prompt. A push to any other remote, or to a URL, asks first.
+- `trustedRepos`: repository roots (absolute or `~/...`) whose project config may also loosen the guard, for example your own dotfiles repo where pushing to `main` is routine.
 To skip the guard for a single push, run it with `ALLOW_BIG_PUSH=1` (in the command or in the environment).
 
 ## Privacy and data

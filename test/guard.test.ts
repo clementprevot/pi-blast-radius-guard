@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import {
 	DEFAULT_CONFIG,
 	gitPushArgs,
+	loadConfig,
 	matchesProtected,
 	mergeDecisions,
 	parseRegex,
@@ -92,6 +96,55 @@ test("projectConfigDirs reads the repo root, then a more specific push directory
 	assert.deepEqual(projectConfigDirs("/repo", "/repo/pkg"), ["/repo", "/repo/pkg"]);
 });
 
+function withConfigs(global: object, project: object, run: (paths: { agentDir: string; repo: string }) => void) {
+	const root = mkdtempSync(join(tmpdir(), "blast-radius-guard-"));
+	const write = (base: string, config: object) => {
+		const dir = join(base, "extensions", "blast-radius-guard");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "config.json"), JSON.stringify(config));
+	};
+	try {
+		const paths = { agentDir: join(root, "agent"), repo: join(root, "repo") };
+		write(paths.agentDir, global);
+		write(join(paths.repo, ".pi"), project);
+		run(paths);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}
+
+const loosening = {
+	threshold: 500,
+	protectedBranches: [],
+	protectDefaultBranch: false,
+	draftAction: "warn",
+	allowedRemotes: ["evil"],
+	trustedRepos: ["/"],
+};
+
+test("loadConfig lets a project config tighten the guard but not loosen it", () => {
+	withConfigs({ draftAction: "warn" }, loosening, ({ agentDir, repo }) => {
+		assert.deepEqual(loadConfig(repo, repo, agentDir), { ...DEFAULT_CONFIG, draftAction: "warn" });
+	});
+	const tightening = { threshold: 10, protectedBranches: ["release/*"], draftAction: "block" };
+	withConfigs({ protectDefaultBranch: false }, { ...tightening, protectDefaultBranch: true }, ({ agentDir, repo }) => {
+		assert.deepEqual(loadConfig(repo, repo, agentDir), {
+			...DEFAULT_CONFIG,
+			...tightening,
+			protectedBranches: [...DEFAULT_CONFIG.protectedBranches, "release/*"],
+			protectDefaultBranch: true,
+		});
+	});
+});
+
+test("loadConfig applies the full project config of a trusted repo, except the remotes", () => {
+	withConfigs({}, loosening, ({ agentDir, repo }) => {
+		const trusted = { trustedRepos: [repo] };
+		writeFileSync(join(agentDir, "extensions", "blast-radius-guard", "config.json"), JSON.stringify(trusted));
+		assert.deepEqual(loadConfig(repo, repo, agentDir), { ...loosening, allowedRemotes: ["origin"], trustedRepos: [repo] });
+	});
+});
+
 test("mergeDecisions keeps the strictest action and every summary", () => {
 	const allow = { action: "allow" as const, summary: "" };
 	const warn = { action: "warn" as const, summary: "a: big" };
@@ -157,9 +210,6 @@ test("matchesProtected honors default branch protection", () => {
 });
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import {
 	configuredPushRemote,
@@ -493,14 +543,27 @@ test("gitUnpushedCommits counts local commits missing from origin, never the rev
 });
 
 test("pushRemote reads the repository a push names", () => {
-	assert.equal(pushRemote(["origin", "main"]), "origin");
-	assert.equal(pushRemote(["--force-with-lease", "upstream", "HEAD:main"]), "upstream");
-	assert.equal(pushRemote(["-o", "ci.skip", "fork", "main"]), "fork");
-	assert.equal(pushRemote(["https://example.com/x.git", "HEAD:main"]), "https://example.com/x.git");
-	assert.equal(pushRemote(["--repo", "fork"]), "fork");
-	assert.equal(pushRemote(["--repo=fork", "--tags"]), "fork");
-	assert.equal(pushRemote(["--tags"]), undefined);
-	assert.equal(pushRemote([]), undefined);
+	const remotes = ["origin", "upstream", "fork"];
+	assert.equal(pushRemote(["origin", "main"], remotes), "origin");
+	assert.equal(pushRemote(["--force-with-lease", "upstream", "HEAD:main"], remotes), "upstream");
+	assert.equal(pushRemote(["-o", "ci.skip", "fork", "main"], remotes), "fork");
+	assert.equal(pushRemote(["https://example.com/x.git", "HEAD:main"], remotes), "https://example.com/x.git");
+	assert.equal(pushRemote(["git@github.com:someone/x.git", "main"], remotes), "git@github.com:someone/x.git");
+	assert.equal(pushRemote([".", "HEAD:main"], remotes), ".");
+	assert.equal(pushRemote(["--repo", "fork"], remotes), "fork");
+	assert.equal(pushRemote(["--repo=fork", "--tags"], remotes), "fork");
+	assert.equal(pushRemote(["--tags"], remotes), undefined);
+	assert.equal(pushRemote([], remotes), undefined);
+});
+
+test("pushRemote skips shell syntax it cannot read", () => {
+	const remotes = ["origin", "upstream"];
+	assert.equal(pushRemote(["--atomic", "$L", "origin", "a", "b"], remotes), "origin");
+	assert.equal(pushRemote(["--atomic", "$(cat", "/tmp/leases)", "upstream", "main"], remotes), "upstream");
+	assert.equal(pushRemote(["--force-with-lease", "2>"], remotes), undefined);
+	assert.equal(pushRemote(["2>/dev/null"], remotes), undefined);
+	assert.equal(pushRemote(["HEAD:main"], remotes), undefined);
+	assert.equal(pushRemote(["$R", "main"], remotes), undefined);
 });
 
 test("configuredPushRemote follows git's precedence for a bare push", async (t) => {

@@ -26,6 +26,7 @@ export interface Config {
 	protectDefaultBranch: boolean;
 	draftAction: "warn" | "block";
 	allowedRemotes: string[];
+	trustedRepos: string[];
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -34,6 +35,7 @@ export const DEFAULT_CONFIG: Config = {
 	protectDefaultBranch: true,
 	draftAction: "warn",
 	allowedRemotes: ["origin"],
+	trustedRepos: [],
 };
 
 function readConfigFile(path: string): Partial<Config> | undefined {
@@ -46,13 +48,31 @@ function readConfigFile(path: string): Partial<Config> | undefined {
 	}
 }
 
-function loadConfig(projectDirs: string[]): Config {
-	const agentDir = process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent");
-	const layers = [
-		join(agentDir, "extensions", EXTENSION_ID, "config.json"),
-		...projectDirs.map((dir) => join(dir, ".pi", "extensions", EXTENSION_ID, "config.json")),
-	].map(readConfigFile);
-	return Object.assign({ ...DEFAULT_CONFIG }, ...layers);
+// A repo's own config can only make the guard stricter, unless the global
+// config lists the repo in trustedRepos: any checkout can ship a .pi folder.
+export function loadConfig(
+	repoRoot: string,
+	pushCwd: string,
+	agentDir = process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent"),
+): Config {
+	const global: Config = { ...DEFAULT_CONFIG, ...readConfigFile(join(agentDir, "extensions", EXTENSION_ID, "config.json")) };
+	const trusted = global.trustedRepos.some((repo) => resolveDir(repo, undefined, homedir()) === repoRoot);
+	const config = { ...global };
+	for (const dir of projectConfigDirs(repoRoot, pushCwd)) {
+		const project = readConfigFile(join(dir, ".pi", "extensions", EXTENSION_ID, "config.json"));
+		if (!project) continue;
+		if (trusted) {
+			Object.assign(config, project);
+			continue;
+		}
+		if (typeof project.threshold === "number") config.threshold = Math.min(config.threshold, project.threshold);
+		if (Array.isArray(project.protectedBranches)) {
+			config.protectedBranches = [...new Set([...config.protectedBranches, ...project.protectedBranches])];
+		}
+		if (project.protectDefaultBranch === true) config.protectDefaultBranch = true;
+		if (project.draftAction === "block") config.draftAction = "block";
+	}
+	return { ...config, allowedRemotes: global.allowedRemotes, trustedRepos: global.trustedRepos };
 }
 
 export function projectConfigDirs(repoRoot: string, pushCwd: string): string[] {
@@ -238,11 +258,22 @@ export function pushTargets(args: string[], currentBranch?: string): string[] {
 	return targets;
 }
 
-// Repository a push names: the first positional argument, else --repo.
-// Undefined for a bare push, which git resolves from config.
-export function pushRemote(args: string[]): string | undefined {
+const URL_LIKE = /:\/\/|^[^\s/@:]+@[^\s/:]+:/;
+
+// Repository a push names: the first positional argument that is a configured
+// remote, "." or a URL, else --repo. Shell syntax the guard cannot read
+// ($VAR, $(...), redirections) never matches, so such a push falls back to the
+// remote git picks from config.
+export function pushRemote(args: string[], remotes: readonly string[]): string | undefined {
+	const isRemote = (token: string) => token === "." || remotes.includes(token) || URL_LIKE.test(token);
 	const { positional, repo } = parsePushArgs(args);
-	return positional[0] ?? repo;
+	return positional.find(isRemote) ?? (repo !== undefined && isRemote(repo) ? repo : undefined);
+}
+
+async function configuredRemotes(cwd: string): Promise<string[]> {
+	return run("git", ["remote"], { cwd })
+		.then((r) => r.stdout.split("\n").filter(Boolean))
+		.catch(() => []);
 }
 
 // The remote a bare `git push` uses, in git's order of precedence.
@@ -267,14 +298,15 @@ async function segmentRemotes(
 	cwd: string,
 	segments: string[][],
 ): Promise<{ remote: string; allowed: boolean }[]> {
-	const { allowedRemotes } = loadConfig(projectConfigDirs(root, cwd));
+	const { allowedRemotes } = loadConfig(root, cwd);
 	const branch = await currentBranch(cwd);
-	const remotes: { remote: string; allowed: boolean }[] = [];
+	const remotes = await configuredRemotes(cwd);
+	const result: { remote: string; allowed: boolean }[] = [];
 	for (const args of segments) {
-		const remote = pushRemote(args) ?? (await configuredPushRemote(cwd, branch));
-		remotes.push({ remote, allowed: remote === "." || allowedRemotes.includes(remote) });
+		const remote = pushRemote(args, remotes) ?? (await configuredPushRemote(cwd, branch));
+		result.push({ remote, allowed: remote === "." || allowedRemotes.includes(remote) });
 	}
-	return remotes;
+	return result;
 }
 
 function repoRoot(cwd: string): Promise<string | undefined> {
@@ -561,7 +593,7 @@ async function evaluateRepo(
 	cwd: string,
 	segments: string[][],
 ): Promise<{ stackBlock: string } | { decision: Decision }> {
-	const config = loadConfig(projectConfigDirs(root, cwd));
+	const config = loadConfig(root, cwd);
 	const deps = realDeps(cwd);
 	const branch = await currentBranch(cwd);
 	const pushSegments = segments.map((args) => ({ args, atomic: args.includes("--atomic") }));
